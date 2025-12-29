@@ -1,0 +1,20 @@
+# secrets / machine-specific
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+*.env
+.env*
+
+# runtime state
+/var/
+/state/
+/data/
+__pycache__/
+*.pyc
+
+# virtualenvs
+.venv/
+venv/

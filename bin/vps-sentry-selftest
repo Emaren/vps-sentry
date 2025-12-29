@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SENTRY="/usr/local/bin/vps-sentry"
+SHIP="/usr/local/bin/vps-sentry-ship"
+
+STATE_DIR="/var/lib/vps-sentry"
+LAST_JSON="$STATE_DIR/last.json"
+MARKER="$STATE_DIR/last_shipped_ts.txt"
+
+DROPIN="/etc/systemd/system/vps-sentry.service.d/ship.conf"
+TMP_UNIT="/etc/systemd/system/zzz-vps-sentry-selftest.service"
+TMP_UNIT_OLD="/etc/systemd/system/zzz-tripwire.service"
+TEST_TRIP="$STATE_DIR/test/tripwire.txt"
+
+die() { echo "FAIL: $*" >&2; exit 1; }
+
+json_alerts_summary() {
+  python3 - "$LAST_JSON" <<'PY'
+import json, sys
+p=sys.argv[1]
+try:
+  d=json.load(open(p,"r"))
+except Exception as e:
+  print(f"(could not read {p}: {e})")
+  sys.exit(0)
+
+alerts=d.get("alerts", [])
+print(f"alerts_type={type(alerts).__name__}")
+if isinstance(alerts, list):
+  print(f"alerts_count={len(alerts)}")
+  for a in alerts:
+    if not isinstance(a, dict):
+      continue
+    title=(a.get("title") or "").strip()
+    detail=(a.get("detail") or "").strip()
+    print(f"- {title}")
+    if detail:
+      lines=[ln.rstrip() for ln in detail.splitlines() if ln.strip()]
+      for ln in lines[:14]:
+        print(f"  {ln}")
+      if len(lines) > 14:
+        print("  ...")
+else:
+  print(f"alerts_value={alerts!r}")
+PY
+}
+
+only_test_tripwire_alerts() {
+  # returns 0 if ONLY alerts are "Watched files changed" and every changed path is under /var/lib/vps-sentry/test/
+  python3 - "$LAST_JSON" <<'PY'
+import json, sys
+p=sys.argv[1]
+d=json.load(open(p,"r"))
+alerts=d.get("alerts", [])
+if not isinstance(alerts, list):
+  sys.exit(1)
+
+changed=[]
+saw=False
+
+for a in alerts:
+  if not isinstance(a, dict):
+    continue
+  title=(a.get("title") or "").strip().lower()
+  detail=(a.get("detail") or "")
+  if title != "watched files changed":
+    sys.exit(2)
+  saw=True
+  for ln in detail.splitlines():
+    ln=ln.strip()
+    if not ln or ln.lower().startswith("changed"):
+      continue
+    if ln.startswith("/"):
+      changed.append(ln)
+
+if not saw or not changed:
+  sys.exit(3)
+
+ok = all(p.startswith("/var/lib/vps-sentry/test/") for p in changed)
+sys.exit(0 if ok else 4)
+PY
+}
+
+accept_baseline_best_effort() {
+  # We don't know the exact flag name on your build, so try a few common ones.
+  for cmd in \
+    "$SENTRY --accept-baseline" \
+    "$SENTRY --accept" \
+    "$SENTRY --baseline-accept" \
+    "$SENTRY --accept_baseline" \
+    "$SENTRY accept" \
+    "$SENTRY baseline accept"
+  do
+    if $cmd >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+echo "== vps-sentry selftest =="
+
+echo
+echo "== 1) binaries =="
+test -x "$SENTRY" || die "missing or not executable: $SENTRY"
+test -x "$SHIP"  || die "missing or not executable: $SHIP"
+"$SENTRY" --version || true
+
+echo
+echo "== 2) systemd wiring =="
+systemctl is-enabled vps-sentry.timer >/dev/null || die "vps-sentry.timer is not enabled"
+systemctl cat vps-sentry.service --no-pager >/dev/null || die "cannot read vps-sentry.service"
+test -f "$DROPIN" || die "missing drop-in: $DROPIN"
+grep -q "ExecStartPost=.*vps-sentry-ship" "$DROPIN" || die "drop-in does not reference vps-sentry-ship: $DROPIN"
+
+echo
+echo "== 3) ship script perms/owner =="
+stat -c '%U %G %a %n' "$SHIP"
+[[ "$(stat -c '%U:%G' "$SHIP")" == "root:root" ]] || die "ship script is not owned by root:root"
+[[ "$(stat -c '%a' "$SHIP")" == "755" ]] || die "ship script perms not 755"
+
+echo
+echo "== 4) cleanup old selftest artifacts =="
+rm -f "$TMP_UNIT" "$TMP_UNIT_OLD" || true
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+echo
+echo "== 5) baseline run + attempt to accept clean baseline =="
+systemctl start vps-sentry.service
+test -f "$LAST_JSON" || die "missing $LAST_JSON after running service"
+
+if accept_baseline_best_effort; then
+  echo "Baseline accept: OK"
+  systemctl start vps-sentry.service
+else
+  echo "Baseline accept: (no known accept flag worked) — continuing anyway"
+  echo "If step 6 fails, it's because baseline still includes real watched changes."
+fi
+
+echo
+echo "Current alerts summary (post-baseline attempt):"
+json_alerts_summary
+
+# marker before
+BEFORE=""
+if [[ -f "$MARKER" ]]; then BEFORE="$(cat "$MARKER")"; fi
+echo
+echo "Ship marker BEFORE: ${BEFORE:-<empty>}"
+
+echo
+echo "== 6) TEST change under /var/lib/vps-sentry/test (should NOT ship bundle) =="
+mkdir -p "$(dirname "$TEST_TRIP")"
+echo "tripwire $(date -Is)" >> "$TEST_TRIP"
+systemctl start vps-sentry.service
+
+if ! only_test_tripwire_alerts; then
+  echo
+  echo "Selftest cannot validate suppression because alerts are not test-only."
+  echo "You still have real watched changes pending (e.g. /etc/systemd/system)."
+  echo
+  echo "Alerts summary:"
+  json_alerts_summary
+  die "make baseline clean (accept), then rerun selftest"
+fi
+
+AFTER=""
+if [[ -f "$MARKER" ]]; then AFTER="$(cat "$MARKER")"; fi
+echo "Ship marker AFTER test-tripwire: ${AFTER:-<empty>}"
+
+if [[ "$AFTER" != "$BEFORE" ]]; then
+  die "ship marker changed on test-only tripwire (expected no bundle upload). before=$BEFORE after=$AFTER"
+fi
+echo "PASS: marker unchanged (no bundle upload) for test-only tripwire."
+
+echo
+echo "== 7) REAL watched change (should ship bundle + update marker) =="
+echo "# selftest $(date -Is)" >> "$TMP_UNIT"
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl start vps-sentry.service
+
+NEW=""
+if [[ -f "$MARKER" ]]; then NEW="$(cat "$MARKER")"; fi
+echo "Ship marker NEW: ${NEW:-<empty>}"
+
+if [[ -z "$NEW" || "$NEW" == "$BEFORE" ]]; then
+  echo
+  echo "Alerts summary:"
+  json_alerts_summary
+  die "ship marker did not change on real watched change (expected bundle upload). before=$BEFORE new=$NEW"
+fi
+echo "PASS: marker updated on real watched change."
+
+echo
+echo "== 8) cleanup (recommended) =="
+echo "sudo rm -f $TMP_UNIT $TMP_UNIT_OLD && sudo systemctl daemon-reload"
+
+echo
+echo "ALL PASS"
