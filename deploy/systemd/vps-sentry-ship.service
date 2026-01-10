@@ -1,0 +1,51 @@
+# /etc/systemd/system/vps-sentry-ship.service
+[Unit]
+Description=VPS Sentry ship (send alert bundle)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Nice=10
+UMask=0077
+
+StateDirectory=vps-sentry
+StateDirectoryMode=0700
+
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/vps-sentry
+Environment=SSH_AUTH_SOCK=
+
+ExecStart=/usr/local/bin/vps-sentry-ship
+
+# ---- Hardening (match main service) ----
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+ProtectSystem=strict
+ProtectHome=read-only
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/var/lib/vps-sentry
+
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+TimeoutStartSec=60s

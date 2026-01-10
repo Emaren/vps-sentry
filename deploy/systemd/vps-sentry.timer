@@ -1,0 +1,24 @@
+# /etc/systemd/system/vps-sentry.timer
+[Unit]
+Description=Run VPS Sentry every 5 minutes
+
+[Timer]
+# First run shortly after boot
+OnBootSec=2min
+
+# Then every 5 minutes after the last successful run
+OnUnitActiveSec=5min
+
+# Keep some jitter so you're not always on the exact 5-min boundary
+RandomizedDelaySec=30s
+
+# Make scheduling tighter (your old 30s is fine, but this is cleaner)
+AccuracySec=1s
+
+# If the VPS was off, run missed checks once on boot
+Persistent=true
+
+Unit=vps-sentry.service
+
+[Install]
+WantedBy=timers.target
