@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  lint-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax checks
+        run: |
+          set -euo pipefail
+          for f in bin/* scripts/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Shellcheck
+        run: shellcheck -x bin/* scripts/*.sh
+
+      - name: Verify systemd unit files
+        run: |
+          set -euo pipefail
+          systemd-analyze verify \
+            deploy/systemd/vps-sentry.service \
+            deploy/systemd/vps-sentry-ship.service \
+            deploy/systemd/vps-sentry.timer
+
+      - name: Assert single unit source directory
+        run: |
+          set -euo pipefail
+          test -d deploy/systemd
+          if [[ -d systemd ]]; then
+            echo "legacy systemd/ directory should not exist"
+            exit 1
+          fi
+
+      - name: Assert security invariants
+        run: |
+          set -euo pipefail
+          grep -q '^\.agent-live/$' .gitignore
+          if grep -Eq '(^|[[:space:]])(\.|source)[[:space:]]+/etc/default/vps-sentry' bin/vps-sentry scripts/install.sh; then
+            echo "unsafe sourcing of /etc/default/vps-sentry detected"
+            exit 1
+          fi
+          grep -q 'webhook_url' bin/vps-sentry-ship
+          grep -q 'fallback' bin/vps-sentry-ship
+          test ! -f deploy/systemd/vps-sentry.timer.d/override.conf

@@ -12,6 +12,18 @@ DROPIN="/etc/systemd/system/vps-sentry.service.d/ship.conf"
 TMP_UNIT="/etc/systemd/system/zzz-vps-sentry-selftest.service"
 TMP_UNIT_OLD="/etc/systemd/system/zzz-tripwire.service"
 TEST_TRIP="$STATE_DIR/test/tripwire.txt"
+CONFIG_JSON="/etc/vps-sentry.json"
+
+WITH_NETWORK=0
+
+usage() {
+  cat <<'EOF'
+Usage: vps-sentry-selftest [--with-network]
+
+Default mode validates deterministic local behavior only.
+Use --with-network to additionally require successful webhook shipping.
+EOF
+}
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -82,6 +94,59 @@ sys.exit(0 if ok else 4)
 PY
 }
 
+watched_alert_mentions_path() {
+  local path="$1"
+  python3 - "$LAST_JSON" "$path" <<'PY'
+import json, sys
+p=sys.argv[1]
+target=sys.argv[2]
+d=json.load(open(p,"r"))
+alerts=d.get("alerts", [])
+if not isinstance(alerts, list):
+  sys.exit(1)
+
+for a in alerts:
+  if not isinstance(a, dict):
+    continue
+  title=(a.get("title") or "").strip().lower()
+  detail=(a.get("detail") or "")
+  if title != "watched files changed":
+    continue
+  for ln in detail.splitlines():
+    if ln.strip() == target:
+      sys.exit(0)
+
+sys.exit(2)
+PY
+}
+
+has_webhook_config() {
+  python3 - "$CONFIG_JSON" <<'PY'
+import json, sys
+p=sys.argv[1]
+try:
+  cfg=json.load(open(p,"r"))
+except Exception:
+  sys.exit(2)
+
+def walk(x):
+  if isinstance(x, dict):
+    for v in x.values():
+      yield from walk(v)
+  elif isinstance(x, list):
+    for v in x:
+      yield from walk(v)
+  elif isinstance(x, str):
+    yield x
+
+for s in walk(cfg):
+  if "discord.com/api/webhooks/" in s or "discordapp.com/api/webhooks/" in s:
+    sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
 accept_baseline_best_effort() {
   # We don't know the exact flag name on your build, so try a few common ones.
   for cmd in \
@@ -99,7 +164,36 @@ accept_baseline_best_effort() {
   return 1
 }
 
+cleanup() {
+  rm -f "$TMP_UNIT" "$TMP_UNIT_OLD" 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-network)
+      WITH_NETWORK=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+trap cleanup EXIT
+
 echo "== vps-sentry selftest =="
+if (( WITH_NETWORK )); then
+  echo "Mode: local + network shipping assertions"
+else
+  echo "Mode: deterministic local checks (network shipping assertion disabled)"
+fi
 
 echo
 echo "== 1) binaries =="
@@ -112,7 +206,7 @@ echo "== 2) systemd wiring =="
 systemctl is-enabled vps-sentry.timer >/dev/null || die "vps-sentry.timer is not enabled"
 systemctl cat vps-sentry.service --no-pager >/dev/null || die "cannot read vps-sentry.service"
 test -f "$DROPIN" || die "missing drop-in: $DROPIN"
-grep -q "ExecStartPost=.*vps-sentry-ship" "$DROPIN" || die "drop-in does not reference vps-sentry-ship: $DROPIN"
+grep -Eq "ExecStartPost=.*vps-sentry-ship" "$DROPIN" || die "drop-in does not reference vps-sentry-ship: $DROPIN"
 
 echo
 echo "== 3) ship script perms/owner =="
@@ -122,8 +216,7 @@ stat -c '%U %G %a %n' "$SHIP"
 
 echo
 echo "== 4) cleanup old selftest artifacts =="
-rm -f "$TMP_UNIT" "$TMP_UNIT_OLD" || true
-systemctl daemon-reload >/dev/null 2>&1 || true
+cleanup
 
 echo
 echo "== 5) baseline run + attempt to accept clean baseline =="
@@ -134,8 +227,8 @@ if accept_baseline_best_effort; then
   echo "Baseline accept: OK"
   systemctl start vps-sentry.service
 else
-  echo "Baseline accept: (no known accept flag worked) — continuing anyway"
-  echo "If step 6 fails, it's because baseline still includes real watched changes."
+  echo "Baseline accept: (no known accept flag worked) - continuing anyway"
+  echo "If step 6 fails, baseline still includes real watched changes."
 fi
 
 echo
@@ -174,26 +267,39 @@ fi
 echo "PASS: marker unchanged (no bundle upload) for test-only tripwire."
 
 echo
-echo "== 7) REAL watched change (should ship bundle + update marker) =="
+echo "== 7) REAL watched change (must alert; shipping assert optional) =="
 echo "# selftest $(date -Is)" >> "$TMP_UNIT"
 systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl start vps-sentry.service
+
+if ! watched_alert_mentions_path "$TMP_UNIT"; then
+  echo
+  echo "Alerts summary:"
+  json_alerts_summary
+  die "expected watched-files alert to include $TMP_UNIT"
+fi
+echo "PASS: watched-files alert includes $TMP_UNIT"
 
 NEW=""
 if [[ -f "$MARKER" ]]; then NEW="$(cat "$MARKER")"; fi
 echo "Ship marker NEW: ${NEW:-<empty>}"
 
-if [[ -z "$NEW" || "$NEW" == "$BEFORE" ]]; then
-  echo
-  echo "Alerts summary:"
-  json_alerts_summary
-  die "ship marker did not change on real watched change (expected bundle upload). before=$BEFORE new=$NEW"
+if (( WITH_NETWORK )); then
+  has_webhook_config || die "--with-network requires a valid webhook in $CONFIG_JSON"
+  if [[ -z "$NEW" || "$NEW" == "$BEFORE" ]]; then
+    echo
+    echo "Alerts summary:"
+    json_alerts_summary
+    die "ship marker did not change on real watched change (expected bundle upload). before=$BEFORE new=$NEW"
+  fi
+  echo "PASS: marker updated on real watched change."
+else
+  if [[ "$NEW" == "$BEFORE" ]]; then
+    echo "PASS: real watched change alert detected (network shipping assertion skipped)."
+  else
+    echo "INFO: marker updated; webhook shipping appears active."
+  fi
 fi
-echo "PASS: marker updated on real watched change."
-
-echo
-echo "== 8) cleanup (recommended) =="
-echo "sudo rm -f $TMP_UNIT $TMP_UNIT_OLD && sudo systemctl daemon-reload"
 
 echo
 echo "ALL PASS"

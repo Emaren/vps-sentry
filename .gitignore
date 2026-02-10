@@ -12,6 +12,7 @@
 /var/
 /state/
 /data/
+.agent-live/
 __pycache__/
 *.pyc
 

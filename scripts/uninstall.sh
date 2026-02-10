@@ -9,7 +9,10 @@ sudo rm -f /usr/local/bin/vps-sentry \
 
 sudo rm -f /etc/systemd/system/vps-sentry.service \
            /etc/systemd/system/vps-sentry.timer \
+           /etc/systemd/system/vps-sentry-ship.service \
            /etc/systemd/system/vps-sentry.service.d/ship.conf
+
+sudo rm -f /etc/default/vps-sentry
 
 sudo rmdir /etc/systemd/system/vps-sentry.service.d 2>/dev/null || true
 
