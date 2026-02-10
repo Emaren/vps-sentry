@@ -52,6 +52,7 @@ need_cmd sudo
 need_cmd install
 need_cmd systemctl
 need_cmd stat
+need_cmd grep
 need_cmd sed
 need_cmd tail
 need_cmd python3
@@ -99,9 +100,14 @@ sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry.service"      /etc/systemd/system
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry.timer"        /etc/systemd/system/vps-sentry.timer
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-ship.service" /etc/systemd/system/vps-sentry-ship.service
 
-sudo mkdir -p /etc/systemd/system/vps-sentry.service.d
-if [[ -f "$UNIT_SRC_DIR/vps-sentry.service.d/ship.conf" ]]; then
-  sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry.service.d/ship.conf" /etc/systemd/system/vps-sentry.service.d/ship.conf
+# Remove a legacy ship.conf drop-in that clears ExecStartPost and can disable
+# other host-specific ExecStartPost hooks (publish/normalize/etc).
+if sudo test -f /etc/systemd/system/vps-sentry.service.d/ship.conf; then
+  if sudo grep -Eq '^[[:space:]]*ExecStartPost[[:space:]]*=[[:space:]]*$' /etc/systemd/system/vps-sentry.service.d/ship.conf; then
+    sudo rm -f /etc/systemd/system/vps-sentry.service.d/ship.conf
+  else
+    warn "found existing /etc/systemd/system/vps-sentry.service.d/ship.conf; leaving in place"
+  fi
 fi
 
 sudo systemctl daemon-reload
