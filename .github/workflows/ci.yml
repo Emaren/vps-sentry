@@ -40,10 +40,18 @@ jobs:
         run: |
           set -euo pipefail
           test -d deploy/systemd
+          test -f deploy/systemd/vps-sentry.service.d/90-post.conf
+          test -f deploy/systemd/vps-sentry.service.d/95-expected-ports.conf
+          test -f runtime/vps_sentry/core_legacy.py
           if [[ -d systemd ]]; then
             echo "legacy systemd/ directory should not exist"
             exit 1
           fi
+
+      - name: Compile tracked runtime source
+        run: |
+          set -euo pipefail
+          python3 -m py_compile runtime/vps_sentry/core_legacy.py
 
       - name: Assert security invariants
         run: |

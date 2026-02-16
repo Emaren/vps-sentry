@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# vps-sentry-publish
+# Goal:
+# - Always keep /var/lib/vps-sentry/public/* fresh for the UI/API
+# - Never leak secrets (only publish a sanitized status payload + last/diff/status)
+# - Be robust if status.json/diff.json are missing or empty
+
+log()  { echo "[VPS-PUBLISH] $*"; logger -t vps-sentry-publish -- "$*"; }
+fail() { log "FAIL: $*"; exit 2; }
+
+STATE="/var/lib/vps-sentry"
+PUB="$STATE/public"
+
+LAST="$STATE/last.json"
+STATUS="$STATE/status.json"
+DIFF="$STATE/diff.json"
+
+# Require last.json (the canonical source)
+[[ -s "$LAST" ]] || fail "missing/empty $LAST (run vps-sentry first)"
+
+# Ensure public dir exists with sane perms
+install -d -m 0755 -o root -g root "$PUB"
+
+# 1) Build a sanitized public status.json directly from last.json
+TMP_STATUS="$(mktemp)"
+python3 - <<'PY' >"$TMP_STATUS"
+import json
+from pathlib import Path
+
+src = Path("/var/lib/vps-sentry/last.json")
+data = json.loads(src.read_text())
+
+auth = data.get("auth") or {}
+alerts = data.get("alerts") or []
+new_ssh = data.get("new_ssh_accepts") or []
+threat = data.get("threat")
+if not isinstance(threat, dict):
+    threat = {
+      "suspicious_processes": [],
+      "outbound_suspicious": [],
+      "persistence_hits": [],
+      "indicators": [],
+    }
+
+public = {
+  "ts": data.get("ts"),
+  "host": data.get("host"),
+  "version": data.get("version"),
+  "baseline_last_accepted_ts": data.get("baseline_last_accepted_ts"),
+  "auth": {
+    "ssh_failed_password": auth.get("ssh_failed_password", 0),
+    "ssh_invalid_user": auth.get("ssh_invalid_user", 0),
+    "new_ssh_accepts_count": len(new_ssh),
+  },
+  "ports_public": data.get("ports_public", []) or [],
+  "public_ports_count": data.get("public_ports_count"),
+  "alerts": alerts,
+  "alerts_count": len(alerts),
+  "threat": threat,
+}
+
+print(json.dumps(public, indent=2, sort_keys=True))
+PY
+
+install -m 0644 -o root -g root "$TMP_STATUS" "$STATUS"
+rm -f "$TMP_STATUS"
+
+# 2) Ensure diff.json is always valid JSON (it may legitimately be empty otherwise)
+#    If missing OR empty -> set to {}
+if [[ ! -s "$DIFF" ]]; then
+  printf "%s\n" "{}" > "$DIFF"
+  chmod 0644 "$DIFF"
+  chown root:root "$DIFF"
+fi
+
+# 3) Publish canonical files to public/ (what the UI/API expects)
+install -m 0644 -o root -g root "$LAST"   "$PUB/last.json"
+install -m 0644 -o root -g root "$STATUS" "$PUB/status.json"
+install -m 0644 -o root -g root "$DIFF"   "$PUB/diff.json"
+
+log "OK: published $(stat -c '%s' "$PUB/last.json")B last.json, $(stat -c '%s' "$PUB/status.json")B status.json, $(stat -c '%s' "$PUB/diff.json")B diff.json"
+exit 0

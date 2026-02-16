@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATUS="/var/lib/vps-sentry/public/status.json"
+[[ -f "$STATUS" ]] || exit 0
+
+tmp="$(mktemp)"
+
+# Format: "udp:68,tcp:22" (comma-separated). Whitespace ok.
+expected="${VPS_SENTRY_EXPECTED_PUBLIC_PORTS:-}"
+
+jq --arg expected "$expected" '
+  def splitcsv($s):
+    if ($s|length)==0 then []
+    else ($s | split(",")
+      | map(gsub("^\\s+|\\s+$";""))
+      | map(select(length>0)))
+    end;
+
+  ($expected | splitcsv(.)) as $exp
+  | (.ports_public // []) as $pp
+  | ($pp | map(
+      select(
+        ((.proto|tostring) + ":" + (.port|tostring)) as $k
+        | ($exp | index($k) | not)
+      )
+    )) as $unexpected
+
+  | .expected_public_ports = $exp
+  | .ports_public_unexpected = $unexpected
+  | .unexpected_public_ports_count = ($unexpected | length)
+' "$STATUS" > "$tmp"
+
+# Preserve perms/ownership as best as we can (mv keeps dir perms; file is replaced)
+cat "$tmp" > "$STATUS"
+rm -f "$tmp"
