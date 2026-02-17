@@ -1304,6 +1304,7 @@ def main():
     ignore_ports = set(cfg.get("ignore_ports", [22, 80, 443]))
     extra_watch_files = cfg.get("watch_files", [])
     max_failed_before_alert = int(cfg.get("alert_failed_ssh_threshold", 25))
+    max_invalid_user_before_alert = int(cfg.get("alert_invalid_user_threshold", 10))
 
     quiet_no_alerts = bool(cfg.get("quiet_no_alerts", True))
     print_full_on_alerts = bool(cfg.get("print_full_on_alerts", True))
@@ -1472,7 +1473,7 @@ def main():
     new_accepts: List[Dict[str, Any]] = []
 
     # --- auth-based alerting
-    if sec["ssh_failed_password"] >= max_failed_before_alert or sec["ssh_invalid_user"] >= 5:
+    if sec["ssh_failed_password"] >= max_failed_before_alert or sec["ssh_invalid_user"] >= max_invalid_user_before_alert:
         auth_alerts.append(make_alert(
             title="SSH noise spike",
             detail=f"Failed password: {sec['ssh_failed_password']}, Invalid user: {sec['ssh_invalid_user']}",
