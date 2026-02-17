@@ -618,6 +618,77 @@ def sample_cpu_used_percent(sample_sec: float = 0.12):
     return _safe_percent(used)
 
 
+def _read_proc_pid_snapshot() -> Dict[int, Dict[str, Any]]:
+    """
+    Read per-process CPU ticks + RSS from /proc.
+    Returns pid -> {pid, name, cpu_ticks, rss_kb}
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    try:
+        page_kb = float(os.sysconf("SC_PAGE_SIZE")) / 1024.0
+    except Exception:
+        page_kb = 4.0
+
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except Exception:
+        entries = []
+
+    for ent in entries:
+        name = ent.name
+        if not name.isdigit():
+            continue
+
+        try:
+            pid = int(name)
+        except Exception:
+            continue
+        if pid <= 0:
+            continue
+
+        try:
+            raw = (ent / "stat").read_text(errors="replace").strip()
+        except Exception:
+            continue
+        if not raw:
+            continue
+
+        l = raw.find("(")
+        r = raw.rfind(")")
+        if l < 0 or r <= l:
+            continue
+
+        comm = raw[l + 1:r].strip() or "unknown"
+        tail = raw[r + 2:].split()
+        # tail[0]=state (field 3). We need fields:
+        # utime (14), stime (15), rss pages (24)
+        if len(tail) < 22:
+            continue
+
+        try:
+            state = tail[0]
+            utime = int(tail[11])
+            stime = int(tail[12])
+            rss_pages = int(tail[21])
+        except Exception:
+            continue
+
+        if state == "Z":
+            continue
+
+        cpu_ticks = max(0, utime + stime)
+        rss_kb = max(0.0, float(rss_pages) * page_kb)
+        out[pid] = {
+            "pid": pid,
+            "name": comm,
+            "cpu_ticks": cpu_ticks,
+            "rss_kb": rss_kb,
+        }
+
+    return out
+
+
 def memory_snapshot() -> Dict[str, Any]:
     mem: Dict[str, int] = {}
     try:
@@ -655,66 +726,77 @@ def collect_resource_vitals(top_n: int = 5) -> Dict[str, Any]:
     cores = int(os.cpu_count() or 1)
     cores = max(1, cores)
 
-    cpu_used_percent = sample_cpu_used_percent()
+    total_1, idle_1 = _read_proc_stat_totals()
+    snap_1 = _read_proc_pid_snapshot()
+    try:
+        time.sleep(0.12)
+    except Exception:
+        pass
+    total_2, idle_2 = _read_proc_stat_totals()
+    snap_2 = _read_proc_pid_snapshot()
+
+    total_dt = int(total_2 - total_1)
+    idle_dt = max(0, int(idle_2 - idle_1))
+    if total_dt > 0:
+        cpu_used_percent = _safe_percent((1.0 - (float(idle_dt) / float(total_dt))) * 100.0)
+    else:
+        cpu_used_percent = sample_cpu_used_percent()
+
     mem = memory_snapshot()
     mem_total_mb = float(mem.get("total_mb", 0.0) or 0.0)
 
-    rc, out = run_cmd(["ps", "-eo", "pid=,comm=,%cpu=,rss=", "--sort=-%cpu"], timeout=25)
+    self_pid = int(os.getpid() or 0)
+    parent_pid = int(os.getppid() or 0)
+    ignore_pids = {self_pid, parent_pid}
+
     rows: List[Dict[str, Any]] = []
-    if rc == 0 or out:
-        for raw in out.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
+    for pid, cur in snap_2.items():
+        if pid in ignore_pids:
+            continue
+        prev = snap_1.get(pid)
+        if prev:
+            cpu_dt = max(0, int(cur.get("cpu_ticks", 0) or 0) - int(prev.get("cpu_ticks", 0) or 0))
+        else:
+            cpu_dt = 0
 
-            parts = line.split(None, 3)
-            if len(parts) < 4:
-                continue
+        cpu_cap = (float(cpu_dt) / float(total_dt) * 100.0) if total_dt > 0 else 0.0
+        rows.append({
+            "pid": pid,
+            "name": str(cur.get("name", "") or "unknown"),
+            "cpu_dt": float(cpu_dt),
+            "cpu_capacity_percent": _safe_percent(cpu_cap),
+            "rss_kb": max(0.0, float(cur.get("rss_kb", 0.0) or 0.0)),
+        })
 
-            try:
-                pid = int(parts[0])
-            except Exception:
-                continue
+    rows.sort(
+        key=lambda r: (
+            float(r.get("cpu_capacity_percent", 0.0) or 0.0),
+            float(r.get("rss_kb", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
 
-            name = (parts[1] or "").strip() or "unknown"
-            try:
-                cpu_raw = float(parts[2])
-            except Exception:
-                cpu_raw = 0.0
-            try:
-                rss_kb = float(parts[3])
-            except Exception:
-                rss_kb = 0.0
-
-            rows.append({
-                "pid": max(0, pid),
-                "name": name,
-                "cpu_raw": max(0.0, cpu_raw),
-                "rss_kb": max(0.0, rss_kb),
-            })
-
-    total_cpu_raw = sum(float(r.get("cpu_raw", 0.0) or 0.0) for r in rows)
+    total_cpu_cap = sum(float(r.get("cpu_capacity_percent", 0.0) or 0.0) for r in rows)
     top_n = max(1, int(top_n or 5))
 
     def _to_proc_payload(row: Dict[str, Any]) -> Dict[str, Any]:
-        cpu_raw = float(row.get("cpu_raw", 0.0) or 0.0)
+        cpu_cap = float(row.get("cpu_capacity_percent", 0.0) or 0.0)
         rss_kb = float(row.get("rss_kb", 0.0) or 0.0)
         mem_mb = max(0.0, rss_kb / 1024.0)
 
-        cpu_share = (cpu_raw / total_cpu_raw * 100.0) if total_cpu_raw > 0 else 0.0
-        cpu_capacity = (cpu_raw / float(cores)) if cores > 0 else 0.0
+        cpu_share = (cpu_cap / total_cpu_cap * 100.0) if total_cpu_cap > 0 else 0.0
         mem_capacity = (mem_mb / mem_total_mb * 100.0) if mem_total_mb > 0 else 0.0
 
         return {
             "pid": int(row.get("pid", 0) or 0),
             "name": str(row.get("name", "") or "unknown"),
             "cpu_share_percent": _safe_percent(cpu_share),
-            "cpu_capacity_percent": _safe_percent(cpu_capacity),
+            "cpu_capacity_percent": _safe_percent(cpu_cap),
             "memory_mb": round(mem_mb, 1),
             "memory_capacity_percent": _safe_percent(mem_capacity),
         }
 
-    ordered = sorted(rows, key=lambda r: (float(r.get("cpu_raw", 0.0) or 0.0), float(r.get("rss_kb", 0.0) or 0.0)), reverse=True)
+    ordered = rows
     top_rows = ordered[:top_n]
     other_rows = ordered[top_n:]
 
@@ -722,12 +804,12 @@ def collect_resource_vitals(top_n: int = 5) -> Dict[str, Any]:
 
     other_payload = None
     if other_rows:
-        other_cpu_raw = sum(float(r.get("cpu_raw", 0.0) or 0.0) for r in other_rows)
+        other_cpu_cap = sum(float(r.get("cpu_capacity_percent", 0.0) or 0.0) for r in other_rows)
         other_rss_kb = sum(float(r.get("rss_kb", 0.0) or 0.0) for r in other_rows)
         other_payload = _to_proc_payload({
             "pid": 0,
             "name": "other-processes",
-            "cpu_raw": other_cpu_raw,
+            "cpu_capacity_percent": other_cpu_cap,
             "rss_kb": other_rss_kb,
         })
 
