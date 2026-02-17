@@ -12,9 +12,11 @@ Group=root
 Nice=10
 UMask=0077
 
-# State dir (/var/lib/vps-sentry) created automatically
+# State dir (/var/lib/vps-sentry) created automatically.
+# 0711 allows non-owner service users to traverse into /public without exposing
+# directory listings or sensitive files under state root.
 StateDirectory=vps-sentry
-StateDirectoryMode=0700
+StateDirectoryMode=0711
 
 # Avoid writing __pycache__ under /home (we keep ProtectSystem=strict)
 Environment=PYTHONDONTWRITEBYTECODE=1
