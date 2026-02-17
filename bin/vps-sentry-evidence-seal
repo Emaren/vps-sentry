@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${VPS_SENTRY_STATE_DIR:-/var/lib/vps-sentry}"
+EVIDENCE_DIR="${VPS_SENTRY_EVIDENCE_DIR:-$STATE_DIR/forensics/evidence}"
+KEY_DIR="${VPS_SENTRY_KEY_DIR:-/etc/vps-sentry}"
+PRIV_KEY="${VPS_SENTRY_EVIDENCE_PRIVKEY:-$KEY_DIR/evidence_signing_key.pem}"
+PUB_KEY="${VPS_SENTRY_EVIDENCE_PUBKEY:-$KEY_DIR/evidence_signing_pub.pem}"
+SOURCE_TAG="manual"
+BUNDLE=""
+COPY_TO_EVIDENCE=0
+AUTO_INIT_KEY=1
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") --bundle PATH [options]
+
+Options:
+  --bundle PATH         Bundle to seal (required)
+  --copy-to-evidence    Copy bundle into evidence/bundles before sealing
+  --source TAG          Source tag in ledger (default: $SOURCE_TAG)
+  --state-dir DIR       Override state root (default: $STATE_DIR)
+  --evidence-dir DIR    Override evidence root (default: $EVIDENCE_DIR)
+  --key-dir DIR         Override key dir (default: $KEY_DIR)
+  --no-auto-init-key    Fail if signing key missing (default auto-create)
+  -h, --help            Show help
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --bundle)
+      BUNDLE="${2:-}"
+      shift
+      ;;
+    --copy-to-evidence)
+      COPY_TO_EVIDENCE=1
+      ;;
+    --source)
+      SOURCE_TAG="${2:-}"
+      shift
+      ;;
+    --state-dir)
+      STATE_DIR="${2:-}"
+      shift
+      ;;
+    --evidence-dir)
+      EVIDENCE_DIR="${2:-}"
+      shift
+      ;;
+    --key-dir)
+      KEY_DIR="${2:-}"
+      shift
+      ;;
+    --no-auto-init-key)
+      AUTO_INIT_KEY=0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+[ -n "$BUNDLE" ] || { echo "Missing --bundle" >&2; exit 2; }
+[ -f "$BUNDLE" ] || { echo "Bundle not found: $BUNDLE" >&2; exit 1; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }
+}
+
+need_cmd openssl
+need_cmd python3
+need_cmd sha256sum
+need_cmd flock
+need_cmd install
+
+file_size_bytes() {
+  local p="$1"
+  if stat -c '%s' "$p" >/dev/null 2>&1; then
+    stat -c '%s' "$p"
+  else
+    stat -f '%z' "$p"
+  fi
+}
+
+LOCKFILE="$EVIDENCE_DIR/.ledger.lock"
+LEDGER="$EVIDENCE_DIR/ledger.jsonl"
+MANIFEST_DIR="$EVIDENCE_DIR/manifests"
+SIG_DIR="$EVIDENCE_DIR/signatures"
+BUNDLE_DIR="$EVIDENCE_DIR/bundles"
+
+install -d -m 0700 "$EVIDENCE_DIR" "$MANIFEST_DIR" "$SIG_DIR" "$BUNDLE_DIR"
+touch "$LEDGER"
+chmod 600 "$LEDGER"
+
+if [ ! -f "$PRIV_KEY" ] || [ ! -f "$PUB_KEY" ]; then
+  if [ "$AUTO_INIT_KEY" -ne 1 ]; then
+    echo "Signing key missing and auto-init disabled." >&2
+    echo "Expected: $PRIV_KEY and $PUB_KEY" >&2
+    exit 1
+  fi
+  install -d -m 0700 "$KEY_DIR"
+  if [ ! -f "$PRIV_KEY" ]; then
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$PRIV_KEY" >/dev/null 2>&1
+    chmod 600 "$PRIV_KEY"
+  fi
+  if [ ! -f "$PUB_KEY" ]; then
+    openssl pkey -in "$PRIV_KEY" -pubout -out "$PUB_KEY" >/dev/null 2>&1
+    chmod 644 "$PUB_KEY"
+  fi
+fi
+
+if [ "$COPY_TO_EVIDENCE" -eq 1 ]; then
+  copied="$BUNDLE_DIR/$(basename "$BUNDLE")"
+  cp -f "$BUNDLE" "$copied"
+  chmod 600 "$copied"
+  BUNDLE="$copied"
+fi
+
+bundle_real="$(readlink -f "$BUNDLE" 2>/dev/null || echo "$BUNDLE")"
+bundle_sha="$(sha256sum "$bundle_real" | awk '{print $1}')"
+bundle_size="$(file_size_bytes "$bundle_real")"
+host="$(hostname)"
+sealed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sealed_id="$(date -u +%Y%m%d-%H%M%S)"
+bundle_base="$(basename "$bundle_real")"
+incident_id="${bundle_base%.tar.gz}"
+manifest="$MANIFEST_DIR/${incident_id}-${sealed_id}.manifest.json"
+signature="$SIG_DIR/${incident_id}-${sealed_id}.manifest.sig"
+
+exec 9>"$LOCKFILE"
+flock -x 9
+
+prev_hash="$(python3 - "$LEDGER" <<'PY'
+import json, sys
+p = sys.argv[1]
+prev = ""
+try:
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            prev = str(entry.get("entry_hash") or "")
+except FileNotFoundError:
+    pass
+print(prev)
+PY
+)"
+
+MANIFEST_PATH="$manifest" \
+BUNDLE_PATH="$bundle_real" \
+BUNDLE_SHA="$bundle_sha" \
+BUNDLE_SIZE="$bundle_size" \
+SEALED_AT="$sealed_at" \
+HOST_NAME="$host" \
+SOURCE_TAG="$SOURCE_TAG" \
+PREV_HASH="$prev_hash" \
+python3 - <<'PY' > "$manifest"
+import json, os
+payload = {
+    "schema": "vps-sentry-evidence-manifest.v1",
+    "sealed_at": os.environ["SEALED_AT"],
+    "host": os.environ["HOST_NAME"],
+    "source": os.environ["SOURCE_TAG"],
+    "bundle_path": os.environ["BUNDLE_PATH"],
+    "bundle_sha256": os.environ["BUNDLE_SHA"],
+    "bundle_size_bytes": int(os.environ["BUNDLE_SIZE"]),
+    "prev_ledger_hash": os.environ.get("PREV_HASH", ""),
+}
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+PY
+
+openssl dgst -sha256 -sign "$PRIV_KEY" -out "$signature" "$manifest"
+chmod 600 "$signature"
+
+manifest_sha="$(sha256sum "$manifest" | awk '{print $1}')"
+signature_sha="$(sha256sum "$signature" | awk '{print $1}')"
+
+entry_hash="$(printf '%s\n%s\n%s\n%s\n%s\n' \
+  "$prev_hash" "$manifest_sha" "$signature_sha" "$bundle_sha" "$sealed_at" \
+  | sha256sum | awk '{print $1}')"
+
+LEDGER_PATH="$LEDGER" \
+SEALED_AT="$sealed_at" \
+HOST_NAME="$host" \
+SOURCE_TAG="$SOURCE_TAG" \
+BUNDLE_PATH="$bundle_real" \
+BUNDLE_SHA="$bundle_sha" \
+MANIFEST_PATH="$manifest" \
+MANIFEST_SHA="$manifest_sha" \
+SIG_PATH="$signature" \
+SIG_SHA="$signature_sha" \
+PREV_HASH="$prev_hash" \
+ENTRY_HASH="$entry_hash" \
+python3 - <<'PY' >> "$LEDGER"
+import json, os
+entry = {
+    "sealed_at": os.environ["SEALED_AT"],
+    "host": os.environ["HOST_NAME"],
+    "source": os.environ["SOURCE_TAG"],
+    "bundle_path": os.environ["BUNDLE_PATH"],
+    "bundle_sha256": os.environ["BUNDLE_SHA"],
+    "manifest_path": os.environ["MANIFEST_PATH"],
+    "manifest_sha256": os.environ["MANIFEST_SHA"],
+    "signature_path": os.environ["SIG_PATH"],
+    "signature_sha256": os.environ["SIG_SHA"],
+    "prev_ledger_hash": os.environ.get("PREV_HASH", ""),
+    "entry_hash": os.environ["ENTRY_HASH"],
+}
+print(json.dumps(entry, sort_keys=True))
+PY
+
+chmod 600 "$LEDGER"
+
+echo "sealed_bundle=$bundle_real"
+echo "manifest=$manifest"
+echo "signature=$signature"
+echo "ledger=$LEDGER"
+echo "entry_hash=$entry_hash"

@@ -225,6 +225,21 @@ BUNDLE="$STATE_DIR/outbox/ship-${SAFE_HOST:-host}-${SAFE_TS:-now}.tar.gz"
 
 tar -czf "$BUNDLE" -C "$TMPDIR" .
 
+# Seal evidence before upload/cleanup so incident data has a signed chain.
+if command -v /usr/local/bin/vps-sentry-evidence-seal >/dev/null 2>&1; then
+  if seal_out="$(
+    /usr/local/bin/vps-sentry-evidence-seal \
+      --bundle "$BUNDLE" \
+      --copy-to-evidence \
+      --source "ship" 2>&1
+  )"; then
+    log "ship: evidence sealed"
+  else
+    log "warn: evidence sealing failed"
+    log "$seal_out"
+  fi
+fi
+
 # send to discord (file upload) - best effort
 CONTENT="VPS Sentry shipping bundle: host=${HOST:-} ts=${TS} alerts=${ALERTS}"
 PAYLOAD="$(CONTENT="$CONTENT" python3 - <<'PY'

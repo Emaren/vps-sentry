@@ -11,6 +11,7 @@ Runs on a systemd timer (default: every 5 minutes):
 * Checks watched files/dirs for changes (tripwires)
 * Records JSON state under `/var/lib/vps-sentry/`
 * Optionally "ships" a bundle when a **real** alert occurs
+* Seals evidence manifests with signed hash-chain ledger entries
 
 ## Feature ranking (most impressive -> least)
 
@@ -22,21 +23,23 @@ Runs on a systemd timer (default: every 5 minutes):
    Correlates auth noise, public listeners, users, watched security paths, cron, firewall, self-integrity, and package drift.
 4. **Self-integrity + service integrity checks**  
    Watches hashes for `/usr/local/bin/vps-sentry` and `vps-sentry.service` and treats integrity drift as high severity.
-5. **Baseline signing guardrails (v1.0.0 runtime)**  
+5. **Signed evidence chain (manifest + ledger)**  
+   Every shipped bundle can be sealed into an append-only hash chain with signatures to improve incident proof integrity.
+6. **Baseline signing guardrails (v1.0.0 runtime)**  
    Supports baseline signature verification/re-signing flow to reduce tamper risk on baseline artifacts.
-6. **Sensitive-change forensics capture**  
+7. **Sensitive-change forensics capture**  
    Captures SSHD and firewall forensic artifacts when those surfaces change.
-7. **Actionable public-port intelligence**  
+8. **Actionable public-port intelligence**  
    Detects public listener drift and enriches alerts with PID/unit/exe/cmdline process attribution.
-8. **Publish + normalize pipeline for dashboards**  
+9. **Publish + normalize pipeline for dashboards**  
    Generates sanitized `/var/lib/vps-sentry/public/status.json` and computes expected vs unexpected public ports.
-9. **Noise controls + memory of seen SSH identities**  
+10. **Noise controls + memory of seen SSH identities**  
    Uses thresholds, webhook cooldowns, and TTL-based "new SSH accept" memory to reduce repeat spam.
-10. **Dual-channel notifications + evidence shipping**  
+11. **Dual-channel notifications + evidence shipping**  
     Supports Discord/email notifications and controlled outbox bundle shipping when alerts are present.
-11. **Hardened systemd posture**  
+12. **Hardened systemd posture**  
     Applies restrictive service settings (`ProtectSystem=strict`, reduced address families, private temp/devices, etc).
-12. **Deterministic self-test tooling**  
+13. **Deterministic self-test tooling**  
     Includes `vps-sentry-selftest` for repeatable validation of local and optional network shipping behavior.
 
 ## Requirements
@@ -129,6 +132,10 @@ Run full checks including required webhook shipping:
 
 * `sudo vps-sentry-selftest --with-network`
 
+Verify signed evidence ledger integrity:
+
+* `sudo vps-sentry-evidence-verify`
+
 ## Troubleshooting
 
 If you see:
@@ -183,6 +190,8 @@ Binaries (installed):
 * `/usr/local/bin/vps-sentry-selftest`
 * `/usr/local/bin/vps-sentry-publish`
 * `/usr/local/bin/vps-sentry-ports-normalize`
+* `/usr/local/bin/vps-sentry-evidence-seal`
+* `/usr/local/bin/vps-sentry-evidence-verify`
 
 Systemd units (installed):
 
@@ -196,6 +205,12 @@ State (runtime):
 
 * `/var/lib/vps-sentry/` (baseline, last run, diffs, ship marker, etc.)
 * `/var/lib/vps-sentry/public/` (`status.json`, `last.json`, `diff.json` published for UI/API)
+* `/var/lib/vps-sentry/forensics/evidence/` (signed manifests, signatures, ledger, sealed bundle copies)
+
+Signing key material:
+
+* `/etc/vps-sentry/evidence_signing_key.pem` (private, root-only)
+* `/etc/vps-sentry/evidence_signing_pub.pem` (public verifier key)
 
 Repo source of truth:
 

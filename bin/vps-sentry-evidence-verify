@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${VPS_SENTRY_STATE_DIR:-/var/lib/vps-sentry}"
+EVIDENCE_DIR="${VPS_SENTRY_EVIDENCE_DIR:-$STATE_DIR/forensics/evidence}"
+KEY_DIR="${VPS_SENTRY_KEY_DIR:-/etc/vps-sentry}"
+PUB_KEY="${VPS_SENTRY_EVIDENCE_PUBKEY:-$KEY_DIR/evidence_signing_pub.pem}"
+LEDGER="${VPS_SENTRY_EVIDENCE_LEDGER:-$EVIDENCE_DIR/ledger.jsonl}"
+MANIFEST=""
+SIGNATURE=""
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [options]
+
+Verify evidence signatures and hash-chain integrity.
+
+Options:
+  --ledger FILE       Ledger file (default: $LEDGER)
+  --manifest FILE     Verify one manifest only (skip ledger chain walk)
+  --signature FILE    Signature file for --manifest mode (optional)
+  --public-key FILE   Public key path (default: $PUB_KEY)
+  --evidence-dir DIR  Override evidence root (default: $EVIDENCE_DIR)
+  -h, --help          Show help
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ledger)
+      LEDGER="${2:-}"
+      shift
+      ;;
+    --manifest)
+      MANIFEST="${2:-}"
+      shift
+      ;;
+    --signature)
+      SIGNATURE="${2:-}"
+      shift
+      ;;
+    --public-key)
+      PUB_KEY="${2:-}"
+      shift
+      ;;
+    --evidence-dir)
+      EVIDENCE_DIR="${2:-}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+[ -f "$PUB_KEY" ] || { echo "Missing public key: $PUB_KEY" >&2; exit 1; }
+
+if [ -n "$MANIFEST" ]; then
+  [ -f "$MANIFEST" ] || { echo "Missing manifest: $MANIFEST" >&2; exit 1; }
+  if [ -z "$SIGNATURE" ]; then
+    base="$(basename "$MANIFEST" .json)"
+    SIGNATURE="$EVIDENCE_DIR/signatures/${base}.sig"
+    if [ ! -f "$SIGNATURE" ]; then
+      SIGNATURE="${MANIFEST}.sig"
+    fi
+  fi
+  [ -f "$SIGNATURE" ] || { echo "Missing signature: $SIGNATURE" >&2; exit 1; }
+fi
+
+PUB_KEY="$PUB_KEY" LEDGER="$LEDGER" MANIFEST="$MANIFEST" SIGNATURE="$SIGNATURE" python3 - <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+pub = Path(os.environ["PUB_KEY"])
+ledger = Path(os.environ.get("LEDGER") or "")
+manifest_only = os.environ.get("MANIFEST") or ""
+signature_only = os.environ.get("SIGNATURE") or ""
+
+def fail(msg: str) -> None:
+    print(f"FAIL {msg}")
+    sys.exit(1)
+
+def sha_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def verify_sig(mpath: Path, spath: Path) -> None:
+    proc = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-verify", str(pub), "-signature", str(spath), str(mpath)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        fail(f"signature verification failed for {mpath}")
+
+def verify_manifest_payload(mpath: Path) -> dict:
+    data = json.loads(mpath.read_text(encoding="utf-8"))
+    bundle_path = Path(str(data.get("bundle_path") or ""))
+    if not bundle_path.exists():
+        fail(f"bundle missing: {bundle_path}")
+    expected = str(data.get("bundle_sha256") or "")
+    actual = sha_file(bundle_path)
+    if expected != actual:
+        fail(f"bundle hash mismatch: {bundle_path}")
+    return data
+
+if manifest_only:
+    mpath = Path(manifest_only)
+    spath = Path(signature_only)
+    verify_sig(mpath, spath)
+    verify_manifest_payload(mpath)
+    print(f"PASS manifest={mpath}")
+    sys.exit(0)
+
+if not ledger.exists():
+    fail(f"ledger missing: {ledger}")
+
+lines = [ln.strip() for ln in ledger.read_text(encoding="utf-8").splitlines() if ln.strip()]
+if not lines:
+    fail(f"ledger empty: {ledger}")
+
+prev = ""
+count = 0
+for idx, ln in enumerate(lines, start=1):
+    try:
+        entry = json.loads(ln)
+    except Exception as exc:
+        fail(f"ledger parse error line {idx}: {exc}")
+
+    mpath = Path(str(entry.get("manifest_path") or ""))
+    spath = Path(str(entry.get("signature_path") or ""))
+    if not mpath.exists():
+        fail(f"manifest missing line {idx}: {mpath}")
+    if not spath.exists():
+        fail(f"signature missing line {idx}: {spath}")
+
+    verify_sig(mpath, spath)
+    manifest = verify_manifest_payload(mpath)
+
+    manifest_sha = sha_file(mpath)
+    sig_sha = sha_file(spath)
+    bundle_sha = str(manifest.get("bundle_sha256") or "")
+    sealed_at = str(entry.get("sealed_at") or "")
+    prev_hash = str(entry.get("prev_ledger_hash") or "")
+    entry_hash = str(entry.get("entry_hash") or "")
+
+    if manifest_sha != str(entry.get("manifest_sha256") or ""):
+        fail(f"manifest sha mismatch line {idx}")
+    if sig_sha != str(entry.get("signature_sha256") or ""):
+        fail(f"signature sha mismatch line {idx}")
+    if bundle_sha != str(entry.get("bundle_sha256") or ""):
+        fail(f"bundle sha mismatch line {idx}")
+    if prev_hash != prev:
+        fail(f"prev hash mismatch line {idx}")
+
+    expected_entry_hash = hashlib.sha256(
+        f"{prev_hash}\n{manifest_sha}\n{sig_sha}\n{bundle_sha}\n{sealed_at}\n".encode("utf-8")
+    ).hexdigest()
+    if expected_entry_hash != entry_hash:
+        fail(f"entry hash mismatch line {idx}")
+
+    prev = entry_hash
+    count += 1
+
+print(f"PASS ledger={ledger} entries={count} head={prev}")
+PY
+

@@ -61,6 +61,7 @@ need_cmd curl
 need_cmd tar
 need_cmd find
 need_cmd mktemp
+need_cmd openssl
 if ! command -v flock >/dev/null 2>&1; then
   warn "flock not found; shipping will run without overlap lock"
 fi
@@ -142,6 +143,8 @@ sudo install -m 0755 bin/vps-sentry-ship     /usr/local/bin/vps-sentry-ship
 sudo install -m 0755 bin/vps-sentry-selftest /usr/local/bin/vps-sentry-selftest
 sudo install -m 0755 bin/vps-sentry-publish  /usr/local/bin/vps-sentry-publish
 sudo install -m 0755 bin/vps-sentry-ports-normalize /usr/local/bin/vps-sentry-ports-normalize
+sudo install -m 0755 bin/vps-sentry-evidence-seal /usr/local/bin/vps-sentry-evidence-seal
+sudo install -m 0755 bin/vps-sentry-evidence-verify /usr/local/bin/vps-sentry-evidence-verify
 
 # Keep runtime IOC engine source in sync with the tracked repo file.
 sudo install -m 0644 "$RUNTIME_CORE_SOURCE" "$RUNTIME_CORE_TARGET"
@@ -181,3 +184,4 @@ echo "  runtime python: $RUNTIME_PY"
 echo "  synced: $RUNTIME_CORE_SOURCE -> $RUNTIME_CORE_TARGET"
 echo "  sudo vps-sentry --format text"
 echo "  sudo vps-sentry --accept-baseline"
+echo "  sudo vps-sentry-evidence-verify"
