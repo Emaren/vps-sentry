@@ -881,7 +881,11 @@ def list_users_snapshot():
     return users
 
 
-def hash_key_files(extra_paths, tight_ufw_watch: bool = False):
+def hash_key_files(
+    extra_paths,
+    tight_ufw_watch: bool = False,
+    watch_systemd_dir: bool = True,
+):
     ufw_paths = []
     if tight_ufw_watch:
         ufw_paths = [
@@ -903,11 +907,12 @@ def hash_key_files(extra_paths, tight_ufw_watch: bool = False):
 
         Path("/etc/nginx/sites-enabled"),
 
-        Path("/etc/systemd/system"),
-
         Path("/etc/sudoers"),
         Path("/etc/sudoers.d"),
     ] + ufw_paths + [Path(p) for p in extra_paths]
+
+    if watch_systemd_dir:
+        paths.append(Path("/etc/systemd/system"))
 
     snap = {}
     for p in paths:
@@ -1311,6 +1316,7 @@ def main():
 
     webhook_cooldown_sec = int(cfg.get("webhook_cooldown_sec", 900))
     tight_ufw_watch = bool(cfg.get("tight_ufw_watch", False))
+    watch_systemd_dir = bool(cfg.get("watch_systemd_dir", True))
 
     ssh_new_accept_alert = bool(cfg.get("alert_on_new_ssh_accept", True))
     ssh_seen_ttl_days = int(cfg.get("ssh_seen_ttl_days", 30))
@@ -1351,7 +1357,11 @@ def main():
     ports_local = [p for p in all_ports if not p.get("public")]
 
     users = list_users_snapshot()
-    keys = hash_key_files(extra_watch_files, tight_ufw_watch=tight_ufw_watch)
+    keys = hash_key_files(
+        extra_watch_files,
+        tight_ufw_watch=tight_ufw_watch,
+        watch_systemd_dir=watch_systemd_dir,
+    )
     cron = cron_snapshot()
     fw = firewall_snapshot()
 
