@@ -32,6 +32,7 @@ import urllib.request
 import sys
 import os
 import ipaddress
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Tuple, Dict, List
@@ -553,6 +554,201 @@ def proc_explain(pid: int) -> Dict[str, Any]:
     out["unit"] = unit
 
     return out
+
+
+# ---------------------------
+# Resource vitals
+# ---------------------------
+
+def _safe_percent(v: float) -> float:
+    try:
+        return round(max(0.0, min(100.0, float(v))), 1)
+    except Exception:
+        return 0.0
+
+
+def _read_proc_stat_totals() -> Tuple[int, int]:
+    """
+    Read aggregate CPU counters from /proc/stat.
+    Returns (total_jiffies, idle_jiffies).
+    """
+    try:
+        first = Path("/proc/stat").read_text(errors="replace").splitlines()[0]
+        parts = first.split()
+        if not parts or parts[0] != "cpu":
+            return 0, 0
+
+        nums: List[int] = []
+        for tok in parts[1:]:
+            try:
+                nums.append(int(tok))
+            except Exception:
+                break
+
+        if len(nums) < 4:
+            return 0, 0
+
+        idle = int(nums[3]) + (int(nums[4]) if len(nums) > 4 else 0)
+        total = int(sum(nums))
+        return total, idle
+    except Exception:
+        return 0, 0
+
+
+def sample_cpu_used_percent(sample_sec: float = 0.12):
+    """
+    CPU usage as % of VPS capacity (0..100), sampled over a short window.
+    """
+    total_1, idle_1 = _read_proc_stat_totals()
+    if total_1 <= 0:
+        return None
+
+    try:
+        time.sleep(max(0.05, min(float(sample_sec), 0.5)))
+    except Exception:
+        pass
+
+    total_2, idle_2 = _read_proc_stat_totals()
+    dt = int(total_2 - total_1)
+    if dt <= 0:
+        return None
+
+    idle_dt = max(0, int(idle_2 - idle_1))
+    used = (1.0 - (float(idle_dt) / float(dt))) * 100.0
+    return _safe_percent(used)
+
+
+def memory_snapshot() -> Dict[str, Any]:
+    mem: Dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text(errors="replace").splitlines():
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            m = re.search(r"(\d+)", v)
+            if not m:
+                continue
+            mem[k.strip()] = int(m.group(1))
+    except Exception:
+        pass
+
+    total_kb = int(mem.get("MemTotal", 0) or 0)
+    avail_kb = int(mem.get("MemAvailable", mem.get("MemFree", 0)) or 0)
+    used_kb = max(0, total_kb - avail_kb)
+
+    total_mb = round(float(total_kb) / 1024.0, 1) if total_kb > 0 else 0.0
+    avail_mb = round(float(avail_kb) / 1024.0, 1) if avail_kb > 0 else 0.0
+    used_mb = round(float(used_kb) / 1024.0, 1) if used_kb > 0 else 0.0
+
+    used_percent = _safe_percent((float(used_kb) / float(total_kb)) * 100.0) if total_kb > 0 else None
+
+    return {
+        "total_mb": total_mb,
+        "used_mb": used_mb,
+        "available_mb": avail_mb,
+        "used_percent": used_percent,
+        "capacity_percent": 100.0,
+    }
+
+
+def collect_resource_vitals(top_n: int = 5) -> Dict[str, Any]:
+    cores = int(os.cpu_count() or 1)
+    cores = max(1, cores)
+
+    cpu_used_percent = sample_cpu_used_percent()
+    mem = memory_snapshot()
+    mem_total_mb = float(mem.get("total_mb", 0.0) or 0.0)
+
+    rc, out = run_cmd(["ps", "-eo", "pid=,comm=,%cpu=,rss=", "--sort=-%cpu"], timeout=25)
+    rows: List[Dict[str, Any]] = []
+    if rc == 0 or out:
+        for raw in out.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+
+            try:
+                pid = int(parts[0])
+            except Exception:
+                continue
+
+            name = (parts[1] or "").strip() or "unknown"
+            try:
+                cpu_raw = float(parts[2])
+            except Exception:
+                cpu_raw = 0.0
+            try:
+                rss_kb = float(parts[3])
+            except Exception:
+                rss_kb = 0.0
+
+            rows.append({
+                "pid": max(0, pid),
+                "name": name,
+                "cpu_raw": max(0.0, cpu_raw),
+                "rss_kb": max(0.0, rss_kb),
+            })
+
+    total_cpu_raw = sum(float(r.get("cpu_raw", 0.0) or 0.0) for r in rows)
+    top_n = max(1, int(top_n or 5))
+
+    def _to_proc_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+        cpu_raw = float(row.get("cpu_raw", 0.0) or 0.0)
+        rss_kb = float(row.get("rss_kb", 0.0) or 0.0)
+        mem_mb = max(0.0, rss_kb / 1024.0)
+
+        cpu_share = (cpu_raw / total_cpu_raw * 100.0) if total_cpu_raw > 0 else 0.0
+        cpu_capacity = (cpu_raw / float(cores)) if cores > 0 else 0.0
+        mem_capacity = (mem_mb / mem_total_mb * 100.0) if mem_total_mb > 0 else 0.0
+
+        return {
+            "pid": int(row.get("pid", 0) or 0),
+            "name": str(row.get("name", "") or "unknown"),
+            "cpu_share_percent": _safe_percent(cpu_share),
+            "cpu_capacity_percent": _safe_percent(cpu_capacity),
+            "memory_mb": round(mem_mb, 1),
+            "memory_capacity_percent": _safe_percent(mem_capacity),
+        }
+
+    ordered = sorted(rows, key=lambda r: (float(r.get("cpu_raw", 0.0) or 0.0), float(r.get("rss_kb", 0.0) or 0.0)), reverse=True)
+    top_rows = ordered[:top_n]
+    other_rows = ordered[top_n:]
+
+    top_payload = [_to_proc_payload(r) for r in top_rows]
+
+    other_payload = None
+    if other_rows:
+        other_cpu_raw = sum(float(r.get("cpu_raw", 0.0) or 0.0) for r in other_rows)
+        other_rss_kb = sum(float(r.get("rss_kb", 0.0) or 0.0) for r in other_rows)
+        other_payload = _to_proc_payload({
+            "pid": 0,
+            "name": "other-processes",
+            "cpu_raw": other_cpu_raw,
+            "rss_kb": other_rss_kb,
+        })
+
+    cpu_share_total = sum(float(p.get("cpu_share_percent", 0.0) or 0.0) for p in top_payload)
+    if other_payload:
+        cpu_share_total += float(other_payload.get("cpu_share_percent", 0.0) or 0.0)
+
+    return {
+        "cpu": {
+            "used_percent": cpu_used_percent,
+            "capacity_percent": 100.0,
+            "cores": cores,
+        },
+        "memory": mem,
+        "processes": {
+            "sampled_count": len(rows),
+            "top": top_payload,
+            "other": other_payload,
+            "cpu_share_total_percent": _safe_percent(cpu_share_total),
+        },
+    }
 
 
 # ---------------------------
@@ -1417,6 +1613,7 @@ def main():
         "persistence_hits": [],
         "indicators": threat_indicators,
     }
+    vitals_payload = collect_resource_vitals(top_n=int(cfg.get("vitals_top_processes", 5)))
 
     ports_public_sigs = sorted([p["sig"] for p in ports_public if p.get("sig")])
 
@@ -1463,6 +1660,7 @@ def main():
             "self_integrity": self_i,
             "packages": {"hash": pkgs.get("hash", ""), "count": pkgs.get("count", 0)},
             "threat": threat_payload,
+            "vitals": vitals_payload,
             "alerts": alerts_payload(ioc_alerts),
         }
 
@@ -1731,6 +1929,7 @@ def main():
             "self_integrity": self_i,
             "packages": {"hash": pkgs.get("hash", ""), "count": pkgs.get("count", 0)},
             "threat": threat_payload,
+            "vitals": vitals_payload,
             # After accepting, suppress baseline alerts; keep auth + IOC alerts.
             "alerts": alerts_payload(auth_alerts + ioc_alerts),
         }
@@ -1800,6 +1999,7 @@ def main():
         "self_integrity": self_i,
         "packages": {"hash": pkgs.get("hash", ""), "count": pkgs.get("count", 0)},
         "threat": threat_payload,
+        "vitals": vitals_payload,
         "alerts": alerts_payload(alerts),
     }
 

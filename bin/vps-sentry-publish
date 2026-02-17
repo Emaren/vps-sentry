@@ -43,6 +43,9 @@ if not isinstance(threat, dict):
       "persistence_hits": [],
       "indicators": [],
     }
+vitals = data.get("vitals")
+if not isinstance(vitals, dict):
+    vitals = None
 
 public = {
   "ts": data.get("ts"),
@@ -59,6 +62,7 @@ public = {
   "alerts": alerts,
   "alerts_count": len(alerts),
   "threat": threat,
+  "vitals": vitals,
 }
 
 print(json.dumps(public, indent=2, sort_keys=True))
