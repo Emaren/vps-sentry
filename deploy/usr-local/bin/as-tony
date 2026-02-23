@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'USAGE'
+Usage:
+  as-tony '<command>'
+
+Examples:
+  as-tony 'whoami; echo $HOME'
+  as-tony 'cd /var/www/VPSSentry/vps-sentry-web && pnpm -s build'
+USAGE
+  exit 2
+fi
+
+cmd="$*"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  # root path: switch user and ensure HOME is tony's home
+  exec /usr/sbin/runuser -u tony -- /usr/bin/env HOME=/home/tony USER=tony LOGNAME=tony /bin/bash -lc "$cmd"
+else
+  # non-root path: requires passwordless sudo (if configured)
+  exec /usr/bin/sudo -n -u tony -H /bin/bash -lc "$cmd"
+fi

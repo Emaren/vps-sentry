@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'USAGE'
+Usage:
+  as-root '<command>'
+
+Examples:
+  as-root 'whoami; echo $HOME'
+  as-root 'systemctl status --no-pager vps-sentry-web.service'
+USAGE
+  exit 2
+fi
+
+cmd="$*"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  exec /bin/bash -lc "$cmd"
+else
+  exec sudo -H /bin/bash -lc "$cmd"
+fi
