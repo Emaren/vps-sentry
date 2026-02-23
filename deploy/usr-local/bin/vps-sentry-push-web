@@ -19,8 +19,6 @@ fi
 source "$ENV_FILE"
 
 # Back-compat + new names:
-# - prefer VPS_SENTRY_PUSH_* if present
-# - else fall back to INGEST_URL / TOKEN (old script)
 URL="${VPS_SENTRY_PUSH_URL:-${INGEST_URL:-${1:-}}}"
 TOKEN_VAL="${VPS_SENTRY_PUSH_TOKEN:-${TOKEN:-}}"
 PAYLOAD="${VPS_SENTRY_PUSH_PAYLOAD:-${2:-$STATUS}}"
@@ -34,4 +32,5 @@ curl -fsS \
   -X POST "$URL" \
   -H "Authorization: Bearer ${TOKEN_VAL}" \
   -H "Content-Type: application/json" \
-  --data-binary @"$PAYLOAD" >/dev/null
+  --data-binary @"$PAYLOAD" \
+  >/dev/null
