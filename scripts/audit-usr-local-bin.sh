@@ -14,7 +14,6 @@ echo "=== audit: repo -> /usr/local/bin"
 missing=0
 differs=0
 
-# Check every repo tool exists + matches in /usr/local/bin
 while IFS= read -r -d '' f; do
   base="$(basename "$f")"
   if [[ ! -f "$DST/$base" ]]; then
@@ -22,8 +21,6 @@ while IFS= read -r -d '' f; do
     missing=$((missing+1))
     continue
   fi
-
-  # compare bytes + mode/owner (we expect root-owned in /usr/local/bin)
   if ! cmp -s "$f" "$DST/$base"; then
     echo "DIFFERS: $base (content mismatch)"
     differs=$((differs+1))
@@ -31,10 +28,16 @@ while IFS= read -r -d '' f; do
 done < <(find "$SRC" -maxdepth 1 -type f -print0)
 
 echo
-echo "=== extras in /usr/local/bin (not in repo set)"
+echo "=== extras in /usr/local/bin (not in repo set; backups ignored)"
 for f in "$DST"/vps-sentry* "$DST"/as-*; do
   [[ -f "$f" ]] || continue
   base="$(basename "$f")"
+
+  # ignore backups + legacy
+  case "$base" in
+    *.bak-*|*.bak.*|*.legacy-* ) continue ;;
+  esac
+
   if [[ ! -f "$SRC/$base" ]]; then
     echo "EXTRA: $f"
   fi
@@ -46,5 +49,4 @@ if [[ "$missing" -eq 0 && "$differs" -eq 0 ]]; then
   echo "OK: /usr/local/bin matches repo deploy set."
   exit 0
 fi
-
 exit 1
