@@ -62,6 +62,7 @@ need_cmd tar
 need_cmd find
 need_cmd mktemp
 need_cmd openssl
+need_cmd jq
 if ! command -v flock >/dev/null 2>&1; then
   warn "flock not found; shipping will run without overlap lock"
 fi
