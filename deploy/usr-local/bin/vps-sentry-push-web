@@ -1,44 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# SAFE push-web helper:
-# - does NOT embed tokens
-# - expects token/url via env or /etc/vps-sentry-push-web.env (0600 root:root)
-
+STATUS_DEFAULT="/var/lib/vps-sentry/public/status.json"
 ENV_FILE="/etc/vps-sentry-push-web.env"
-if [[ -f "$ENV_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
+
+# If there's nothing to send, do nothing (keeps oneshot happy)
+STATUS="${VPS_SENTRY_PUSH_PAYLOAD:-$STATUS_DEFAULT}"
+if [[ ! -s "$STATUS" ]]; then
+  exit 0
 fi
 
-URL="${VPS_SENTRY_PUSH_URL:-${1:-}}"
-PAYLOAD="${VPS_SENTRY_PUSH_PAYLOAD:-${2:-}}"
-TOKEN="${VPS_SENTRY_PUSH_TOKEN:-}"
-
-if [[ -z "${URL:-}" || -z "${PAYLOAD:-}" ]]; then
-  cat <<'USAGE' >&2
-Usage:
-  vps-sentry-push-web <url> <payload.json>
-
-Env (preferred):
-  /etc/vps-sentry-push-web.env (0600 root:root):
-    VPS_SENTRY_PUSH_URL=...
-    VPS_SENTRY_PUSH_TOKEN=...
-    VPS_SENTRY_PUSH_PAYLOAD=...
-
-Notes:
-- This script intentionally will NOT work without a token in env.
-USAGE
-  exit 2
+# If not configured, do nothing (matches old behavior)
+if [[ ! -f "$ENV_FILE" ]]; then
+  exit 0
 fi
 
-if [[ -z "${TOKEN:-}" ]]; then
-  echo "FATAL: missing VPS_SENTRY_PUSH_TOKEN (set in /etc/vps-sentry-push-web.env)" >&2
-  exit 1
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+# Back-compat + new names:
+# - prefer VPS_SENTRY_PUSH_* if present
+# - else fall back to INGEST_URL / TOKEN (old script)
+URL="${VPS_SENTRY_PUSH_URL:-${INGEST_URL:-${1:-}}}"
+TOKEN_VAL="${VPS_SENTRY_PUSH_TOKEN:-${TOKEN:-}}"
+PAYLOAD="${VPS_SENTRY_PUSH_PAYLOAD:-${2:-$STATUS}}"
+
+# If still not configured, do nothing (keeps service green)
+if [[ -z "${URL:-}" || -z "${TOKEN_VAL:-}" ]]; then
+  exit 0
 fi
 
 curl -fsS \
-  -H "Authorization: Bearer ${TOKEN}" \
+  -X POST "$URL" \
+  -H "Authorization: Bearer ${TOKEN_VAL}" \
   -H "Content-Type: application/json" \
-  --data-binary @"${PAYLOAD}" \
-  "${URL}"
+  --data-binary @"$PAYLOAD" >/dev/null
