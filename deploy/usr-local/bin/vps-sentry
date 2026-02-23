@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_RUNTIME="/opt/vps-sentry/venv/bin/vps-sentry"
+RUNTIME_FROM_ENV="${VPS_SENTRY_RUNTIME:-}"
+RUNTIME_BIN="$DEFAULT_RUNTIME"
+DEFAULTS_FILE="/etc/default/vps-sentry"
+
+die() {
+  echo "vps-sentry: $*" >&2
+  exit 127
+}
+
+strip_outer_quotes() {
+  local s="$1"
+  if [[ "$s" == \"*\" && "$s" == *\" ]]; then
+    s="${s:1:${#s}-2}"
+  elif [[ "$s" == \'*\' && "$s" == *\' ]]; then
+    s="${s:1:${#s}-2}"
+  fi
+  printf '%s' "$s"
+}
+
+runtime_from_defaults_file() {
+  local file="$1" owner mode mode_dec raw
+
+  [[ -f "$file" ]] || return 0
+  [[ ! -L "$file" ]] || die "refusing symlink override file: $file"
+
+  owner="$(stat -c '%u:%g' "$file" 2>/dev/null || true)"
+  [[ "$owner" == "0:0" ]] || die "unsafe owner for $file (expected root:root)"
+
+  mode="$(stat -c '%a' "$file" 2>/dev/null || true)"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "unable to read safe mode for $file"
+  mode_dec=$((8#$mode))
+  (( (mode_dec & 0022) == 0 )) || die "unsafe permissions for $file (must not be group/other writable)"
+
+  raw="$(sed -n 's/^[[:space:]]*VPS_SENTRY_RUNTIME[[:space:]]*=[[:space:]]*//p' "$file" | tail -n 1)"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  [[ -n "$raw" ]] || return 0
+
+  strip_outer_quotes "$raw"
+}
+
+# Optional override file for systemd environments.
+if [[ -z "$RUNTIME_FROM_ENV" ]]; then
+  RUNTIME_FROM_ENV="$(runtime_from_defaults_file "$DEFAULTS_FILE")"
+fi
+
+if [[ -n "$RUNTIME_FROM_ENV" ]]; then
+  RUNTIME_BIN="$RUNTIME_FROM_ENV"
+else
+  RUNTIME_BIN="${VPS_SENTRY_RUNTIME:-$DEFAULT_RUNTIME}"
+fi
+
+if [[ ! -x "$RUNTIME_BIN" ]]; then
+  cat >&2 <<EOF
+vps-sentry: runtime binary not found or not executable: $RUNTIME_BIN
+Expected default runtime at: $DEFAULT_RUNTIME
+Fix: install the runtime binary, or set VPS_SENTRY_RUNTIME to a valid executable path.
+EOF
+  exit 127
+fi
+
+exec "$RUNTIME_BIN" "$@"

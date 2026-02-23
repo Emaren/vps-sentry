@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="/var/lib/vps-sentry"
+LAST_JSON="$STATE_DIR/last.json"
+DIFF_JSON="$STATE_DIR/diff.json"
+BASELINE_JSON="$STATE_DIR/baseline.json"
+FORENSICS_DIR="$STATE_DIR/forensics"
+MARKER="$STATE_DIR/last_shipped_ts.txt"
+CONFIG_JSON="/etc/vps-sentry.json"
+
+log() {
+  printf 'vps-sentry-ship: %s\n' "$*" >&2
+}
+
+mkdir -p "$STATE_DIR"
+
+# Prevent overlapping ships (timer + manual runs, or back-to-back systemd starts)
+LOCKFILE="$STATE_DIR/ship.lock"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    log "skip: lock busy ($LOCKFILE)"
+    exit 0
+  fi
+else
+  log "warn: flock not found; running without overlap lock"
+fi
+
+# nothing to ship if last.json doesn't exist
+if [[ ! -f "$LAST_JSON" ]]; then
+  log "skip: missing $LAST_JSON"
+  exit 0
+fi
+
+# Read TS / ALERTS / HOST from last.json.
+# In v1.0.0, "alerts" is a LIST (confirmed), so count = len(list).
+if ! IFS=$'\t' read -r TS ALERTS HOST < <(
+python3 - "$LAST_JSON" <<'PY'
+import json, sys
+
+p = sys.argv[1]
+d = json.load(open(p, "r"))
+
+ts = d.get("ts", "") or ""
+host = d.get("host", "") or ""
+
+a = d.get("alerts", [])
+if isinstance(a, list):
+    alerts = len(a)
+else:
+    # fallback if schema changes later
+    try:
+        alerts = int(a or 0)
+    except Exception:
+        alerts = 0
+
+print(f"{ts}\t{alerts}\t{host}")
+PY
+)
+then
+  log "skip: failed to parse $LAST_JSON"
+  exit 0
+fi
+
+# nothing to ship
+if [[ "${ALERTS:-0}" -le 0 ]]; then
+  log "skip: alerts=0"
+  exit 0
+fi
+
+# if no TS, don't ship (avoid spamming)
+if [[ -z "${TS:-}" ]]; then
+  log "skip: missing ts in $LAST_JSON"
+  exit 0
+fi
+
+# Ignore shipping bundles when the ONLY alerts are "Watched files changed"
+# AND every changed path is under /var/lib/vps-sentry/test/
+set +e
+python3 - "$LAST_JSON" <<'PY'
+import json, sys
+
+p=sys.argv[1]
+d=json.load(open(p,"r"))
+alerts=d.get("alerts", [])
+
+# If schema changes, don't suppress.
+if not isinstance(alerts, list):
+    sys.exit(0)
+
+changed_paths=[]
+saw_watched=False
+
+for a in alerts:
+    if not isinstance(a, dict):
+        continue
+    title=(a.get("title") or "").strip()
+    detail=(a.get("detail") or "").strip()
+
+    if title.lower() != "watched files changed":
+        # Any other alert type => do NOT suppress shipping.
+        sys.exit(0)
+
+    saw_watched = True
+    # detail typically:
+    # "Changed:\n/path1\n/path2"
+    for line in detail.splitlines():
+        line=line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("changed"):
+            continue
+        # only keep path-like lines
+        if line.startswith("/"):
+            changed_paths.append(line)
+
+# Suppress only if we actually saw watched changes, and all are test paths.
+if saw_watched and changed_paths and all(p.startswith("/var/lib/vps-sentry/test/") for p in changed_paths):
+    sys.exit(10)
+
+sys.exit(0)
+PY
+rc=$?
+set -e
+if [[ "$rc" -eq 10 ]]; then
+  log "skip: suppressed test-only watched-file change"
+  exit 0
+fi
+# any other nonzero rc: don't crash the service; just continue shipping logic
+# (we'll still dedupe below)
+if [[ "$rc" -ne 0 ]]; then
+  log "warn: suppression check returned rc=$rc; continuing"
+fi
+
+# dedupe: if we already shipped this exact run timestamp, skip
+if [[ -f "$MARKER" ]] && [[ "$(cat "$MARKER")" == "$TS" ]]; then
+  log "skip: already shipped ts=$TS"
+  exit 0
+fi
+
+if [[ ! -f "$CONFIG_JSON" ]]; then
+  log "skip: missing config $CONFIG_JSON"
+  exit 0
+fi
+
+# find discord webhook (explicit key first, recursive fallback)
+if ! IFS=$'\t' read -r WEBHOOK_SOURCE WEBHOOK < <(
+python3 - "$CONFIG_JSON" <<'PY'
+import json, sys
+
+p = sys.argv[1]
+cfg = json.load(open(p, "r"))
+
+def is_webhook(s):
+    return isinstance(s, str) and (
+        "discord.com/api/webhooks/" in s or
+        "discordapp.com/api/webhooks/" in s
+    )
+
+def explicit_webhook(data):
+    if not isinstance(data, dict):
+        return None
+    notify = data.get("notify")
+    if not isinstance(notify, dict):
+        return None
+    discord = notify.get("discord")
+    if not isinstance(discord, dict):
+        return None
+    return discord.get("webhook_url")
+
+def walk(x):
+    if isinstance(x, dict):
+        for v in x.values():
+            yield from walk(v)
+    elif isinstance(x, list):
+        for v in x:
+            yield from walk(v)
+    elif isinstance(x, str):
+        yield x
+
+explicit = explicit_webhook(cfg)
+if is_webhook(explicit):
+    print(f"explicit\t{explicit}")
+    raise SystemExit(0)
+
+for s in walk(cfg):
+    if is_webhook(s):
+        print(f"fallback\t{s}")
+        raise SystemExit(0)
+
+raise SystemExit(2)
+PY
+ ); then
+  log "skip: unable to read webhook from $CONFIG_JSON"
+  exit 0
+fi
+
+# if webhook empty, nothing we can do
+if [[ -z "${WEBHOOK:-}" ]]; then
+  log "skip: webhook empty in $CONFIG_JSON"
+  exit 0
+fi
+log "ship: webhook source=${WEBHOOK_SOURCE:-unknown}"
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Bundle the essentials
+cp -f "$LAST_JSON" "$TMPDIR/" || true
+cp -f "$BASELINE_JSON" "$TMPDIR/" || true
+cp -f "$DIFF_JSON" "$TMPDIR/" 2>/dev/null || true
+
+# include forensics files modified in the last 20 minutes (if any)
+if [[ -d "$FORENSICS_DIR" ]]; then
+  while IFS= read -r -d '' f; do
+    cp -f "$f" "$TMPDIR/" || true
+  done < <(find "$FORENSICS_DIR" -maxdepth 1 -type f -mmin -20 -print0 2>/dev/null || true)
+fi
+
+SAFE_TS="$(echo "$TS" | tr ': ' '--' | tr -cd '[:alnum:]-._')"
+SAFE_HOST="$(echo "${HOST:-host}" | tr -cd '[:alnum:]-._')"
+mkdir -p "$STATE_DIR/outbox"
+BUNDLE="$STATE_DIR/outbox/ship-${SAFE_HOST:-host}-${SAFE_TS:-now}.tar.gz"
+
+tar -czf "$BUNDLE" -C "$TMPDIR" .
+
+# Seal evidence before upload/cleanup so incident data has a signed chain.
+if command -v /usr/local/bin/vps-sentry-evidence-seal >/dev/null 2>&1; then
+  if seal_out="$(
+    /usr/local/bin/vps-sentry-evidence-seal \
+      --bundle "$BUNDLE" \
+      --copy-to-evidence \
+      --source "ship" 2>&1
+  )"; then
+    log "ship: evidence sealed"
+  else
+    log "warn: evidence sealing failed"
+    log "$seal_out"
+  fi
+fi
+
+# send to discord (file upload) - best effort
+CONTENT="VPS Sentry shipping bundle: host=${HOST:-} ts=${TS} alerts=${ALERTS}"
+PAYLOAD="$(CONTENT="$CONTENT" python3 - <<'PY'
+import json, os
+print(json.dumps({"content": os.environ.get("CONTENT", "")}))
+PY
+)"
+
+log "ship: attempting upload ts=$TS alerts=$ALERTS host=${HOST:-unknown}"
+if curl -fsS -X POST \
+  -F "payload_json=$PAYLOAD" \
+  -F "file=@${BUNDLE}" \
+  "$WEBHOOK" >/dev/null; then
+  # only mark shipped if upload succeeded
+  echo "$TS" > "$MARKER"
+  log "ship: success ts=$TS"
+else
+  log "ship: upload failed ts=$TS"
+fi
+
+# always delete local bundle to keep disk tiny
+rm -f "$BUNDLE" || true
+
+exit 0

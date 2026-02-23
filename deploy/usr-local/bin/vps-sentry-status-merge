@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+
+pub=/var/lib/vps-sentry/public
+status="$pub/status.json"
+last="$pub/last.json"
+
+[[ -s "$status" && -s "$last" ]] || exit 0
+
+tmp="$(mktemp "$pub/.status.json.tmp.XXXXXX")"
+
+# Never fail the unit if jq hiccups — just skip the merge.
+if ! jq -s '
+  .[0] as $s
+  | .[1] as $l
+  | $s
+    + {
+        ports_local:  ($s.ports_local  // $s.ports.local  // $l.ports_local  // $l.ports.local  // []),
+        ports_public: ($s.ports_public // $s.ports.public // $l.ports_public // $l.ports.public // []),
+        vitals:       ($l.vitals // $s.vitals // {})
+      }
+' "$status" "$last" >"$tmp"; then
+  rm -f "$tmp"
+  exit 0
+fi
+
+install -m0644 "$tmp" "$status"
+rm -f "$tmp"

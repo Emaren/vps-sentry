@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATUS="/var/lib/vps-sentry/public/status.json"
+[[ -f "$STATUS" ]] || exit 0
+
+tmp="$(mktemp)"
+
+# Format: "udp:68,tcp:22" (comma-separated). Whitespace ok.
+expected="${VPS_SENTRY_EXPECTED_PUBLIC_PORTS:-}"
+if [ -z "$expected" ] && [ -f /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf ]; then
+  expected="$(sed -n 's/^Environment=VPS_SENTRY_EXPECTED_PUBLIC_PORTS=//p' /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf | tail -n1 | tr -d "\"'")"
+fi
+# Format mirrors expected list. Built from explicit UFW "DENY IN" rules.
+blocked=""
+
+if command -v ufw >/dev/null 2>&1; then
+  blocked="$(
+    (ufw status 2>/dev/null || true) \
+      | awk '
+          {
+            to = $1
+            action = $2
+            direction = $3
+            gsub(/\(v6\)/, "", to)
+            if (to ~ /^[0-9]+\/(tcp|udp)$/ && (action == "DENY" || action == "REJECT") && direction != "OUT") {
+              split(to, parts, "/")
+              if (length(parts) == 2) {
+                printf "%s:%s\n", tolower(parts[2]), parts[1]
+              }
+            }
+          }
+        ' \
+      | sort -u \
+      | paste -sd, -
+  )"
+fi
+
+jq --arg expected "$expected" --arg blocked "$blocked" '
+  def splitcsv($s):
+    if ($s|length)==0 then []
+    else ($s | split(",")
+      | map(gsub("^\\s+|\\s+$";""))
+      | map(select(length>0)))
+    end;
+
+  ($expected | splitcsv(.)) as $exp
+  | ($blocked | splitcsv(.)) as $blk
+  | (.ports_public // []) as $pp
+  | ($pp | map(
+      select(
+        ((.proto|tostring|ascii_downcase) + ":" + (.port|tostring)) as $k
+        | (($exp | index($k) | not) and ($blk | index($k) | not))
+      )
+    )) as $unexpected
+  | ($pp | map(
+      select(
+        ((.proto|tostring|ascii_downcase) + ":" + (.port|tostring)) as $k
+        | ($blk | index($k))
+      )
+    )) as $blocked_public
+
+  | .expected_public_ports = $exp
+  | .blocked_inbound_ports = $blk
+  | .ports_public_blocked_inbound = $blocked_public
+  | .blocked_public_ports_count = ($blocked_public | length)
+  | .ports_public_unexpected = $unexpected
+  | .unexpected_public_ports_count = ($unexpected | length)
+' "$STATUS" > "$tmp"
+
+# Preserve perms/ownership as best as we can (mv keeps dir perms; file is replaced)
+cat "$tmp" > "$STATUS"
+rm -f "$tmp"

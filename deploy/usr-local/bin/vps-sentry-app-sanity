@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# vps-sentry-app-sanity
+# Goal:
+# - Be STRICT when the web app is expected to be live
+# - Be QUIET + NON-FATAL when the app isn't deployed/configured yet (no .env.local),
+#   so vps-sentry.service doesn't look "broken" just because the UI isn't configured.
+
+log()  { echo "[APP-SANITY] $*"; logger -t vps-sentry-app-sanity -- "$*"; }
+warn() { log "WARN: $*"; exit 0; }
+fail() { log "FAIL: $*"; exit 2; }
+
+APP_HOST="https://vps-sentry.tokentap.ca"
+WEB_DIR="/var/www/VPSSentry"
+ENV_LOCAL="$WEB_DIR/.env.local"
+ENV_FILE="$WEB_DIR/.env"
+
+# If the web UI service isn't running, don't tank VPS-Sentry runs.
+# This is an auxiliary check.
+if ! systemctl is-active --quiet vps-sentry-web.service; then
+  warn "vps-sentry-web.service not active (skipping app sanity)"
+fi
+
+# If env isn't present, treat as "not configured yet" and skip quietly.
+# This is the specific issue you hit.
+if [[ ! -f "$ENV_LOCAL" ]]; then
+  warn "missing $ENV_LOCAL (skipping app sanity; app not configured/deployed here)"
+fi
+
+# healthz should work if service is active; if it doesn't, that's a real signal.
+curl -fsS "$APP_HOST/healthz" >/dev/null || fail "healthz failed: $APP_HOST/healthz"
+
+# .env is optional; .env.local is required (for deployed config)
+# If .env exists, validate it too.
+files_to_check=("$ENV_LOCAL")
+if [[ -f "$ENV_FILE" ]]; then
+  files_to_check+=("$ENV_FILE")
+fi
+
+for f in "${files_to_check[@]}"; do
+  perms="$(stat -c '%a' "$f")"
+  if [[ "$perms" != "600" && "$perms" != "400" ]]; then
+    fail "bad perms on $f (got $perms; want 600/400)"
+  fi
+done
+
+# Prefer DATABASE_URL from .env.local; fallback to .env if present.
+dburl=""
+if rg -q '^DATABASE_URL=' "$ENV_LOCAL" 2>/dev/null; then
+  dburl="$(rg -n '^DATABASE_URL=' "$ENV_LOCAL" | head -n 1 | sed -E 's/.*DATABASE_URL="?([^"]+)"?/\1/')"
+elif [[ -f "$ENV_FILE" ]] && rg -q '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null; then
+  dburl="$(rg -n '^DATABASE_URL=' "$ENV_FILE" | head -n 1 | sed -E 's/.*DATABASE_URL="?([^"]+)"?/\1/')"
+fi
+
+[[ -n "${dburl:-}" ]] || fail "DATABASE_URL not found in $ENV_LOCAL (or $ENV_FILE)"
+
+# Only support sqlite file: URLs here (otherwise this check isn't applicable)
+if [[ "$dburl" != file:* ]]; then
+  warn "DATABASE_URL is not sqlite file:... (got: $dburl) (skipping sqlite checks)"
+fi
+
+# sqlite path resolution for file: URLs
+dbpath="${dburl#file:}"
+if [[ "$dbpath" == ./* ]]; then
+  dbpath="$WEB_DIR/${dbpath#./}"
+fi
+
+# If it's relative without ./, treat it as relative to WEB_DIR.
+if [[ "$dbpath" != /* ]]; then
+  dbpath="$WEB_DIR/$dbpath"
+fi
+
+[[ -f "$dbpath" ]] || fail "DATABASE_URL points to missing db: $dbpath"
+size="$(stat -c '%s' "$dbpath")"
+[[ "$size" -gt 0 ]] || fail "sqlite db is empty (0 bytes): $dbpath"
+
+# Schema sanity (NextAuth tables)
+sqlite3 "$dbpath" ".tables" | rg -q '\bUser\b'              || fail "sqlite missing table: User"
+sqlite3 "$dbpath" ".tables" | rg -q '\bSession\b'           || fail "sqlite missing table: Session"
+sqlite3 "$dbpath" ".tables" | rg -q '\bAccount\b'           || fail "sqlite missing table: Account"
+sqlite3 "$dbpath" ".tables" | rg -q '\bVerificationToken\b' || fail "sqlite missing table: VerificationToken"
+
+# Footgun: repo-root dev.db should not exist (or if it does, it should be the real DB you intended)
+if [[ -f "$WEB_DIR/dev.db" ]]; then
+  s2="$(stat -c '%s' "$WEB_DIR/dev.db")"
+  if [[ "$s2" -eq 0 ]]; then
+    fail "repo-root dev.db exists AND is empty (classic DATABASE_URL footgun): $WEB_DIR/dev.db"
+  else
+    # still suspicious — keep it as FAIL so you notice early
+    fail "repo-root dev.db exists (unexpected): $WEB_DIR/dev.db (size=$s2)"
+  fi
+fi
+
+log "OK: service+health+db+env look sane"
+exit 0
