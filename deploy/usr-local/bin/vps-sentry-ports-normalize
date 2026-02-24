@@ -11,6 +11,10 @@ expected="${VPS_SENTRY_EXPECTED_PUBLIC_PORTS:-}"
 if [ -z "$expected" ] && [ -f /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf ]; then
   expected="$(sed -n 's/^Environment=VPS_SENTRY_EXPECTED_PUBLIC_PORTS=//p' /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf | tail -n1 | tr -d "\"'")"
 fi
+expected_ranges="${VPS_SENTRY_EXPECTED_PUBLIC_PORT_RANGES:-}"
+if [ -z "$expected_ranges" ] && [ -f /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf ]; then
+  expected_ranges="$(sed -n 's/^Environment=VPS_SENTRY_EXPECTED_PUBLIC_PORT_RANGES=//p' /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf | tail -n1 | tr -d "\"'")"
+fi
 # Format mirrors expected list. Built from explicit UFW "DENY IN" rules.
 blocked=""
 
@@ -36,7 +40,7 @@ if command -v ufw >/dev/null 2>&1; then
   )"
 fi
 
-jq --arg expected "$expected" --arg blocked "$blocked" '
+jq --arg expected "$expected" --arg expected_ranges "$expected_ranges" --arg blocked "$blocked" '
   def splitcsv($s):
     if ($s|length)==0 then []
     else ($s | split(",")
@@ -44,13 +48,32 @@ jq --arg expected "$expected" --arg blocked "$blocked" '
       | map(select(length>0)))
     end;
 
-  ($expected | splitcsv(.)) as $exp
+  def parse_rule($r):
+    ($r | ascii_downcase | gsub("\\s+";"")) as $x
+    | if ($x | test("^(tcp|udp):[0-9]+$")) then
+        ($x | split(":")) as $p
+        | { proto: $p[0], min: ($p[1]|tonumber), max: ($p[1]|tonumber) }
+      elif ($x | test("^(tcp|udp):[0-9]+-[0-9]+$")) then
+        ($x | split(":")) as $p
+        | ($p[1] | split("-")) as $r
+        | { proto: $p[0], min: ($r[0]|tonumber), max: ($r[1]|tonumber) }
+      else
+        null
+      end;
+
+  def any_rule_match($rules; $proto; $port):
+    any($rules[]?; .proto == $proto and ($port >= .min and $port <= .max));
+
+  (($expected | splitcsv(.)) + ($expected_ranges | splitcsv(.))) as $exp_raw
+  | ($exp_raw | map(parse_rule(.)) | map(select(. != null))) as $exp_rules
   | ($blocked | splitcsv(.)) as $blk
   | (.ports_public // []) as $pp
   | ($pp | map(
       select(
-        ((.proto|tostring|ascii_downcase) + ":" + (.port|tostring)) as $k
-        | (($exp | index($k) | not) and ($blk | index($k) | not))
+        (.proto|tostring|ascii_downcase) as $proto
+        | (.port|tonumber) as $port
+        | (($proto + ":" + ($port|tostring)) as $k
+          | ((any_rule_match($exp_rules; $proto; $port) | not) and ($blk | index($k) | not)))
       )
     )) as $unexpected
   | ($pp | map(
@@ -60,7 +83,7 @@ jq --arg expected "$expected" --arg blocked "$blocked" '
       )
     )) as $blocked_public
 
-  | .expected_public_ports = $exp
+  | .expected_public_ports = $exp_raw
   | .blocked_inbound_ports = $blk
   | .ports_public_blocked_inbound = $blocked_public
   | .blocked_public_ports_count = ($blocked_public | length)

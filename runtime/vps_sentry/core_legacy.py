@@ -470,6 +470,85 @@ def _extract_pid_from_ss_line(line: str) -> int:
         return 0
 
 
+def parse_public_port_rules(raw: Any) -> List[Tuple[str, int, int]]:
+    """
+    Parse allowlist entries like:
+      - "tcp:22"
+      - "udp:68"
+      - "tcp:3100-3199"
+      - comma-separated strings, or arrays of strings
+    """
+    tokens: List[str] = []
+    if isinstance(raw, str):
+        tokens.extend([x.strip() for x in raw.split(",")])
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                tokens.extend([x.strip() for x in item.split(",")])
+
+    rules: List[Tuple[str, int, int]] = []
+    for token in tokens:
+        t = re.sub(r"\s+", "", str(token or "").lower())
+        if not t or ":" not in t:
+            continue
+        proto, rhs = t.split(":", 1)
+        if proto not in ("tcp", "udp"):
+            continue
+
+        lo = 0
+        hi = 0
+        if "-" in rhs:
+            left, right = rhs.split("-", 1)
+            if not left.isdigit() or not right.isdigit():
+                continue
+            lo = int(left)
+            hi = int(right)
+        else:
+            if not rhs.isdigit():
+                continue
+            lo = int(rhs)
+            hi = lo
+
+        if lo <= 0 or hi <= 0:
+            continue
+        if lo > hi:
+            lo, hi = hi, lo
+
+        rules.append((proto, lo, hi))
+
+    # Stable de-duplication
+    seen = set()
+    uniq: List[Tuple[str, int, int]] = []
+    for r in rules:
+        if r in seen:
+            continue
+        seen.add(r)
+        uniq.append(r)
+    return uniq
+
+
+def _sig_proto_port(sig: str) -> Tuple[str, int]:
+    try:
+        parts = str(sig or "").split("|")
+        if len(parts) < 3:
+            return "", 0
+        proto = (parts[0] or "").strip().lower()
+        port = int(parts[2])
+        return proto, port
+    except Exception:
+        return "", 0
+
+
+def is_expected_public_port_sig(sig: str, rules: List[Tuple[str, int, int]]) -> bool:
+    proto, port = _sig_proto_port(sig)
+    if proto not in ("tcp", "udp") or port <= 0:
+        return False
+    for rp, lo, hi in rules:
+        if proto == rp and lo <= port <= hi:
+            return True
+    return False
+
+
 def list_listening_ports():
     rc, out = run_cmd(["ss", "-lntupH"], timeout=20)
     if rc != 0 and not out:
@@ -1001,22 +1080,32 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
         r"python[23]?\s+-c\s+.*socket",
     ]
     default_exe_patterns = [r"^/(tmp|var/tmp|dev/shm|run)/"]
+    default_user_exec_patterns = [
+        r"^/home/[^/\s]+/\.local/share/[^/\s]+$",
+        r"^/home/[^/\s]+/\.cache/[^/\s]+$",
+        r"^/home/[^/\s]+/\.config/[^/\s]+$",
+    ]
 
     name_re = _compile_regex_list(cfg.get("process_ioc_name_regex", default_name_patterns))
     cmd_re = _compile_regex_list(cfg.get("process_ioc_cmdline_regex", default_cmd_patterns))
     exe_re = _compile_regex_list(cfg.get("process_ioc_exe_regex", default_exe_patterns))
+    user_exec_re = _compile_regex_list(cfg.get("process_ioc_user_exec_regex", default_user_exec_patterns))
     allow_re = _compile_regex_list(cfg.get("process_ioc_allow_regex", []))
 
     outbound_unique_threshold = int(cfg.get("process_ioc_outbound_unique_dst_threshold", 20))
     max_hits = int(cfg.get("process_ioc_max_hits", 10))
+    try:
+        user_exec_cpu_threshold = float(cfg.get("process_ioc_user_exec_cpu_threshold", 40.0))
+    except Exception:
+        user_exec_cpu_threshold = 40.0
 
-    rc, out = run_cmd(["ps", "-eo", "pid=,ppid=,user=,comm=,args="], timeout=25)
+    rc, out = run_cmd(["ps", "-eo", "pid=,ppid=,pcpu=,user=,comm=,args="], timeout=25)
     if rc != 0 and not out:
         return []
 
     hits: List[Dict[str, Any]] = []
     for line in out.splitlines():
-        m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s*(.*)$", line)
+        m = re.match(r"^\s*(\d+)\s+(\d+)\s+([0-9]+(?:\.[0-9]+)?)\s+(\S+)\s+(\S+)\s*(.*)$", line)
         if not m:
             continue
 
@@ -1024,9 +1113,13 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
         if pid <= 1:
             continue
         ppid = int(m.group(2))
-        user = m.group(3)
-        comm = m.group(4)
-        args = (m.group(5) or "").strip()
+        try:
+            pcpu = float(m.group(3) or 0.0)
+        except Exception:
+            pcpu = 0.0
+        user = m.group(4)
+        comm = m.group(5)
+        args = (m.group(6) or "").strip()
 
         reasons: List[str] = []
         text = f"{comm}\n{args}"
@@ -1040,6 +1133,17 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
             reasons.append(
                 f"high outbound fanout ({int(ob.get('unique_dst_ips',0) or 0)} unique destinations)"
             )
+
+        argv0 = args.split()[0] if args else ""
+        if argv0 and any(r.search(argv0) for r in user_exec_re):
+            if pcpu >= user_exec_cpu_threshold:
+                reasons.append(
+                    f"high-CPU process ({pcpu:.1f}%) executing from user-writable path ({argv0})"
+                )
+            elif ppid == 1:
+                reasons.append(f"detached process (ppid=1) executing from user-writable path ({argv0})")
+            elif ob:
+                reasons.append(f"process with public outbound connection executing from user-writable path ({argv0})")
 
         # No signal yet, skip expensive /proc reads.
         if not reasons:
@@ -1069,6 +1173,7 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
             "ppid": ppid,
             "user": user,
             "proc": comm,
+            "cpu_percent": round(max(0.0, float(pcpu)), 1),
             "exe": exe,
             "unit": unit,
             "cmdline": clamp(cmdline, 240),
@@ -1115,6 +1220,12 @@ def _build_process_ioc_detail(hits: List[Dict[str, Any]]) -> str:
     lines = ["Suspicious process IOC(s) detected."]
     for h in (hits or [])[:8]:
         lines.append(f"- pid={h.get('pid')} user={h.get('user','?')} proc={h.get('proc','?')}")
+        try:
+            cpu_pct = float(h.get("cpu_percent", 0.0) or 0.0)
+            if cpu_pct > 0:
+                lines.append(f"  cpu={cpu_pct:.1f}%")
+        except Exception:
+            pass
         exe = str(h.get("exe", "") or "")
         if exe:
             lines.append(f"  exe={exe}")
@@ -1599,6 +1710,12 @@ def main():
     ssh_new_accept_alert = bool(cfg.get("alert_on_new_ssh_accept", True))
     ssh_seen_ttl_days = int(cfg.get("ssh_seen_ttl_days", 30))
 
+    expected_public_port_rules = parse_public_port_rules(cfg.get("expected_public_ports", []))
+    expected_public_port_rules.extend(parse_public_port_rules(os.environ.get("VPS_SENTRY_EXPECTED_PUBLIC_PORTS", "")))
+    expected_public_port_rules.extend(parse_public_port_rules(os.environ.get("VPS_SENTRY_EXPECTED_PUBLIC_PORT_RANGES", "")))
+    # Keep order while deduping merged config + env sources.
+    expected_public_port_rules = list(dict.fromkeys(expected_public_port_rules))
+
     run_ts = now_iso()
     run_e = now_epoch()
     host = get_hostname()
@@ -1697,6 +1814,70 @@ def main():
     }
     vitals_payload = collect_resource_vitals(top_n=int(cfg.get("vitals_top_processes", 5)))
 
+    if bool(cfg.get("enable_cpu_hotspot_alert", True)):
+        try:
+            cpu_total_threshold = float(cfg.get("cpu_hotspot_total_threshold_percent", 95.0))
+        except Exception:
+            cpu_total_threshold = 95.0
+        try:
+            cpu_process_threshold = float(cfg.get("cpu_hotspot_process_threshold_percent", 70.0))
+        except Exception:
+            cpu_process_threshold = 70.0
+        try:
+            cpu_process_min_mem_mb = float(cfg.get("cpu_hotspot_process_min_memory_mb", 128.0))
+        except Exception:
+            cpu_process_min_mem_mb = 128.0
+
+        vcpu = (vitals_payload.get("cpu") or {}) if isinstance(vitals_payload, dict) else {}
+        vproc = (vitals_payload.get("processes") or {}) if isinstance(vitals_payload, dict) else {}
+        top_rows = vproc.get("top") if isinstance(vproc, dict) else []
+        top0 = top_rows[0] if isinstance(top_rows, list) and top_rows else {}
+        if not isinstance(top0, dict):
+            top0 = {}
+
+        try:
+            cpu_used_now = float(vcpu.get("used_percent", 0.0) or 0.0)
+        except Exception:
+            cpu_used_now = 0.0
+        try:
+            top_cpu_cap = float(top0.get("cpu_capacity_percent", 0.0) or 0.0)
+        except Exception:
+            top_cpu_cap = 0.0
+        try:
+            top_mem_mb = float(top0.get("memory_mb", 0.0) or 0.0)
+        except Exception:
+            top_mem_mb = 0.0
+
+        top_name = str(top0.get("name", "") or "unknown")
+        try:
+            top_pid = int(top0.get("pid", 0) or 0)
+        except Exception:
+            top_pid = 0
+
+        if (
+            cpu_used_now >= cpu_total_threshold
+            and top_cpu_cap >= cpu_process_threshold
+            and top_mem_mb >= cpu_process_min_mem_mb
+        ):
+            ioc_alerts.append(make_alert(
+                title="CPU hotspot detected",
+                detail=(
+                    f"Host CPU at {cpu_used_now:.1f}% with process {top_name} (pid={top_pid}) "
+                    f"using {top_cpu_cap:.1f}% CPU cap and {top_mem_mb:.1f}MB RAM."
+                ),
+                severity="warn",
+                code="cpu_hotspot",
+            ))
+            threat_indicators.append({
+                "id": "cpu-hotspot",
+                "severity": "warn",
+                "title": "CPU hotspot detected",
+                "detail": (
+                    f"Host CPU {cpu_used_now:.1f}% and top process {top_name} "
+                    f"(pid={top_pid}) at {top_cpu_cap:.1f}% CPU cap."
+                ),
+            })
+
     ports_public_sigs = sorted([p["sig"] for p in ports_public if p.get("sig")])
 
     baseline = state.get("baseline", {}) or {}
@@ -1790,8 +1971,14 @@ def main():
     port_change_explain: Dict[str, Any] = {}
 
     if old_set != new_set:
-        added = sorted(list(new_set - old_set))
-        removed = sorted(list(old_set - new_set))
+        added_all = sorted(list(new_set - old_set))
+        removed_all = sorted(list(old_set - new_set))
+        if expected_public_port_rules:
+            added = [s for s in added_all if not is_expected_public_port_sig(s, expected_public_port_rules)]
+            removed = [s for s in removed_all if not is_expected_public_port_sig(s, expected_public_port_rules)]
+        else:
+            added = added_all
+            removed = removed_all
 
         sig_to_port = {p.get("sig", ""): p for p in ports_public if p.get("sig")}
         sig_to_raw = {s: (sig_to_port.get(s, {}) or {}).get("raw", "") for s in added}
@@ -1831,12 +2018,13 @@ def main():
             for s in removed[:20]:
                 detail_lines.append(f"- {s}")
 
-        baseline_alerts.append(make_alert(
-            title="Public listening ports changed",
-            detail="\n".join(detail_lines) or "Public listeners differ from baseline.",
-            severity="warn",
-            code="public_ports_changed",
-        ))
+        if detail_lines:
+            baseline_alerts.append(make_alert(
+                title="Public listening ports changed",
+                detail="\n".join(detail_lines) or "Public listeners differ from baseline.",
+                severity="warn",
+                code="public_ports_changed",
+            ))
 
     # --- users changed
     old_users = baseline.get("users", [])

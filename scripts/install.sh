@@ -147,6 +147,11 @@ sudo install -m 0755 bin/vps-sentry-ports-normalize /usr/local/bin/vps-sentry-po
 sudo install -m 0755 bin/vps-sentry-evidence-seal /usr/local/bin/vps-sentry-evidence-seal
 sudo install -m 0755 bin/vps-sentry-evidence-verify /usr/local/bin/vps-sentry-evidence-verify
 
+# Keep auxiliary /usr/local/bin tooling in sync (app sanity, push-web, etc).
+if [[ -x scripts/install-usr-local-bin.sh ]]; then
+  sudo bash scripts/install-usr-local-bin.sh
+fi
+
 # Keep runtime IOC engine source in sync with the tracked repo file.
 sudo install -m 0644 "$RUNTIME_CORE_SOURCE" "$RUNTIME_CORE_TARGET"
 

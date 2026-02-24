@@ -7,10 +7,68 @@ DIFF_JSON="$STATE_DIR/diff.json"
 BASELINE_JSON="$STATE_DIR/baseline.json"
 FORENSICS_DIR="$STATE_DIR/forensics"
 MARKER="$STATE_DIR/last_shipped_ts.txt"
+INVALID_WEBHOOK_MARKER="$STATE_DIR/ship_invalid_webhook.txt"
 CONFIG_JSON="/etc/vps-sentry.json"
+EVIDENCE_KEY_DIR="${VPS_SENTRY_KEY_DIR:-/var/lib/vps-sentry/keys}"
+INVALID_WEBHOOK_COOLDOWN_SEC="${VPS_SENTRY_SHIP_INVALID_WEBHOOK_COOLDOWN_SEC:-3600}"
 
 log() {
   printf 'vps-sentry-ship: %s\n' "$*" >&2
+}
+
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+    return 0
+  fi
+  return 1
+}
+
+webhook_fingerprint() {
+  local webhook="$1"
+  if fp="$(printf '%s' "$webhook" | sha256_text 2>/dev/null)"; then
+    printf '%s' "$fp"
+    return 0
+  fi
+  printf '%s' "$webhook"
+}
+
+cooldown_seconds() {
+  local raw="${INVALID_WEBHOOK_COOLDOWN_SEC:-3600}"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '3600'
+}
+
+should_pause_invalid_webhook() {
+  local fp="$1"
+  local cooldown="$2"
+  [[ -f "$INVALID_WEBHOOK_MARKER" ]] || return 1
+
+  local marker_fp="" marker_ts=""
+  if ! IFS=$'\t' read -r marker_fp marker_ts < "$INVALID_WEBHOOK_MARKER"; then
+    return 1
+  fi
+  [[ -n "$marker_fp" ]] || return 1
+  [[ -n "$marker_ts" ]] || return 1
+  [[ "$marker_fp" == "$fp" ]] || return 1
+  [[ "$marker_ts" =~ ^[0-9]+$ ]] || return 1
+
+  local now
+  now="$(date +%s)"
+  local age=$(( now - marker_ts ))
+  if (( age < cooldown )); then
+    local remain=$(( cooldown - age ))
+    log "skip: webhook currently marked invalid; retry in ${remain}s (or update webhook config)"
+    return 0
+  fi
+  return 1
 }
 
 mkdir -p "$STATE_DIR"
@@ -203,6 +261,12 @@ if [[ -z "${WEBHOOK:-}" ]]; then
 fi
 log "ship: webhook source=${WEBHOOK_SOURCE:-unknown}"
 
+WEBHOOK_FP="$(webhook_fingerprint "$WEBHOOK")"
+COOLDOWN_SEC="$(cooldown_seconds)"
+if should_pause_invalid_webhook "$WEBHOOK_FP" "$COOLDOWN_SEC"; then
+  exit 0
+fi
+
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -230,6 +294,7 @@ if command -v /usr/local/bin/vps-sentry-evidence-seal >/dev/null 2>&1; then
   if seal_out="$(
     /usr/local/bin/vps-sentry-evidence-seal \
       --bundle "$BUNDLE" \
+      --key-dir "$EVIDENCE_KEY_DIR" \
       --copy-to-evidence \
       --source "ship" 2>&1
   )"; then
@@ -249,15 +314,39 @@ PY
 )"
 
 log "ship: attempting upload ts=$TS alerts=$ALERTS host=${HOST:-unknown}"
-if curl -fsS -X POST \
-  -F "payload_json=$PAYLOAD" \
-  -F "file=@${BUNDLE}" \
-  "$WEBHOOK" >/dev/null; then
+upload_response="$TMPDIR/upload.response"
+set +e
+upload_code="$(
+  curl -sS -o "$upload_response" -w '%{http_code}' -X POST \
+    -F "payload_json=$PAYLOAD" \
+    -F "file=@${BUNDLE}" \
+    "$WEBHOOK"
+)"
+upload_exit=$?
+set -e
+
+if [[ "$upload_exit" -eq 0 && "$upload_code" =~ ^2[0-9][0-9]$ ]]; then
   # only mark shipped if upload succeeded
   echo "$TS" > "$MARKER"
+  rm -f "$INVALID_WEBHOOK_MARKER" 2>/dev/null || true
   log "ship: success ts=$TS"
 else
-  log "ship: upload failed ts=$TS"
+  log "ship: upload failed ts=$TS exit=$upload_exit http=${upload_code:-000}"
+  invalid_webhook=0
+  if [[ -s "$upload_response" ]]; then
+    upload_excerpt="$(head -c 300 "$upload_response" | tr '\n' ' ' | tr '\r' ' ')"
+    log "ship: upload response: $upload_excerpt"
+    if [[ "${upload_code:-}" == "404" ]] && [[ "$upload_excerpt" == *"Unknown Webhook"* || "$upload_excerpt" == *"\"code\":10015"* ]]; then
+      invalid_webhook=1
+    fi
+  elif [[ "${upload_code:-}" == "404" ]]; then
+    invalid_webhook=1
+  fi
+
+  if [[ "$invalid_webhook" -eq 1 ]]; then
+    printf '%s\t%s\n' "$WEBHOOK_FP" "$(date +%s)" > "$INVALID_WEBHOOK_MARKER"
+    log "ship: webhook appears invalid (Discord Unknown Webhook). Pausing upload attempts for ${COOLDOWN_SEC}s unless config changes."
+  fi
 fi
 
 # always delete local bundle to keep disk tiny

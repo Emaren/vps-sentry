@@ -18,6 +18,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/var/lib/vps-sentry
 Environment=SSH_AUTH_SOCK=
+Environment=VPS_SENTRY_KEY_DIR=/var/lib/vps-sentry/keys
 
 ExecStart=/usr/local/bin/vps-sentry-ship
 

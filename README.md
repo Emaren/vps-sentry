@@ -105,6 +105,13 @@ If you intentionally changed watched things, re-accept baseline:
 
 * `sudo vps-sentry --accept-baseline`
 
+For build-mode public service growth (example: `3100-3199` frontend and `3400-3499` backend),
+configure `/etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf` and run:
+
+* `sudo systemctl daemon-reload`
+* `sudo systemctl start vps-sentry.service`
+* `sudo vps-sentry --accept-baseline`
+
 ## Uninstall
 
 1. `cd ~/repos/vps-sentry`
@@ -180,6 +187,16 @@ If you see:
   * `sudo journalctl -u vps-sentry-ship.service -n 120 --no-pager`
   * Shipping now logs explicit skip/failure reasons (missing config, duplicate ts, test-only alert, webhook parse failure, upload failure).
   * Preferred config key is `notify.discord.webhook_url` in `/etc/vps-sentry.json` (recursive fallback still supported).
+  * For hardened ship service, signing keys are written under `/var/lib/vps-sentry/keys` by default.
+
+* Intentional public ports still appear as `public_ports_changed`
+
+  * Use expected public port config in `/etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf`.
+  * Supported formats: exact ports (`tcp:443`) and ranges (`tcp:3100-3199`).
+  * After changing expected ports, run:
+    * `sudo systemctl daemon-reload`
+    * `sudo systemctl start vps-sentry.service`
+    * `sudo vps-sentry --accept-baseline`
 
 ## Files + paths
 
@@ -209,8 +226,8 @@ State (runtime):
 
 Signing key material:
 
-* `/etc/vps-sentry/evidence_signing_key.pem` (private, root-only)
-* `/etc/vps-sentry/evidence_signing_pub.pem` (public verifier key)
+* Ship service default: `/var/lib/vps-sentry/keys/evidence_signing_key.pem` + `/var/lib/vps-sentry/keys/evidence_signing_pub.pem`
+* Override path supported with `VPS_SENTRY_KEY_DIR`
 
 Repo source of truth:
 

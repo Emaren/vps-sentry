@@ -11,8 +11,13 @@ log()  { echo "[APP-SANITY] $*"; logger -t vps-sentry-app-sanity -- "$*"; }
 warn() { log "WARN: $*"; exit 0; }
 fail() { log "FAIL: $*"; exit 2; }
 
-APP_HOST="https://vps-sentry.tokentap.ca"
-WEB_DIR="/var/www/VPSSentry"
+redact_url_secret() {
+  local raw="$1"
+  printf '%s' "$raw" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#g'
+}
+
+APP_HOST="${VPS_SENTRY_APP_HOST:-https://vps-sentry.tokentap.ca}"
+WEB_DIR="${VPS_SENTRY_WEB_DIR:-/var/www/VPSSentry/vps-sentry-web}"
 ENV_LOCAL="$WEB_DIR/.env.local"
 ENV_FILE="$WEB_DIR/.env"
 
@@ -23,17 +28,18 @@ if ! systemctl is-active --quiet vps-sentry-web.service; then
 fi
 
 # If env isn't present, treat as "not configured yet" and skip quietly.
-# This is the specific issue you hit.
-if [[ ! -f "$ENV_LOCAL" ]]; then
-  warn "missing $ENV_LOCAL (skipping app sanity; app not configured/deployed here)"
+if [[ ! -f "$ENV_LOCAL" && ! -f "$ENV_FILE" ]]; then
+  warn "missing $ENV_LOCAL and $ENV_FILE (skipping app sanity; app not configured/deployed here)"
 fi
 
 # healthz should work if service is active; if it doesn't, that's a real signal.
 curl -fsS "$APP_HOST/healthz" >/dev/null || fail "healthz failed: $APP_HOST/healthz"
 
-# .env is optional; .env.local is required (for deployed config)
-# If .env exists, validate it too.
-files_to_check=("$ENV_LOCAL")
+# Validate whichever env files exist.
+files_to_check=()
+if [[ -f "$ENV_LOCAL" ]]; then
+  files_to_check+=("$ENV_LOCAL")
+fi
 if [[ -f "$ENV_FILE" ]]; then
   files_to_check+=("$ENV_FILE")
 fi
@@ -57,7 +63,8 @@ fi
 
 # Only support sqlite file: URLs here (otherwise this check isn't applicable)
 if [[ "$dburl" != file:* ]]; then
-  warn "DATABASE_URL is not sqlite file:... (got: $dburl) (skipping sqlite checks)"
+  safe_dburl="$(redact_url_secret "$dburl")"
+  warn "DATABASE_URL is not sqlite file:... (got: $safe_dburl) (skipping sqlite checks)"
 fi
 
 # sqlite path resolution for file: URLs
