@@ -28,6 +28,13 @@ jobs:
       - name: Shellcheck
         run: shellcheck -x bin/* scripts/*.sh
 
+      - name: Prepare systemd verify shims
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/local/bin
+          sudo install -m 0755 bin/vps-sentry /usr/local/bin/vps-sentry
+          sudo install -m 0755 bin/vps-sentry-ship /usr/local/bin/vps-sentry-ship
+
       - name: Verify systemd unit files
         run: |
           set -euo pipefail
