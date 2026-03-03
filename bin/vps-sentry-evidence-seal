@@ -159,7 +159,6 @@ print(prev)
 PY
 )"
 
-MANIFEST_PATH="$manifest" \
 BUNDLE_PATH="$bundle_real" \
 BUNDLE_SHA="$bundle_sha" \
 BUNDLE_SIZE="$bundle_size" \
@@ -192,7 +191,6 @@ entry_hash="$(printf '%s\n%s\n%s\n%s\n%s\n' \
   "$prev_hash" "$manifest_sha" "$signature_sha" "$bundle_sha" "$sealed_at" \
   | sha256sum | awk '{print $1}')"
 
-LEDGER_PATH="$LEDGER" \
 SEALED_AT="$sealed_at" \
 HOST_NAME="$host" \
 SOURCE_TAG="$SOURCE_TAG" \
