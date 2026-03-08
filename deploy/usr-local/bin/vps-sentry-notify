@@ -1097,6 +1097,22 @@ handle_ship_last() {
   done
 
   [[ -f "$last_json" ]] || die "missing last.json: $last_json"
+  local snapshot_host snapshot_ts
+  if ! IFS=$'\t' read -r snapshot_host snapshot_ts < <(
+python3 - "$last_json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1]))
+host = (payload.get("host") or "").strip()
+ts = (payload.get("ts") or "").strip()
+print(f"{host}\t{ts}")
+PY
+); then
+    snapshot_host=""
+    snapshot_ts="$(iso_utc_now)"
+  fi
+  [[ -n "$snapshot_ts" ]] || snapshot_ts="$(iso_utc_now)"
   local tmpdir
   tmpdir="$(mktemp -d)"
   python3 - "$last_json" "$tmpdir" <<'PY'
@@ -1122,8 +1138,9 @@ for index, alert in enumerate(alerts):
     code = (alert.get("code") or "").strip()
     title = (alert.get("title") or "Host alert").strip()
     detail = (alert.get("detail") or "").strip()
-    project = ""
-    service = ""
+    project = (alert.get("project") or "").strip()
+    service = (alert.get("service") or "").strip()
+    path = (alert.get("path") or "/").strip() or "/"
     if code in {"app_service_inactive", "app_healthz_failed", "app_readyz_failed", "app_sanity_failed", "app_public_status_unreadable"}:
         project = "vps-sentry"
         service = "vps-sentry-web.service"
@@ -1137,6 +1154,11 @@ for index, alert in enumerate(alerts):
         fingerprint = f"service_public_status_unreadable:{host}:{project}:{service}"
     elif code == "app_sanity_failed":
         fingerprint = f"service_sanity_failed:{host}:{project}:{service or 'vps-sentry-web'}"
+    elif code in {"host_disk_warn", "host_disk_critical"}:
+        project = project or "vps-host"
+        fingerprint = f"host_disk_pressure:{host}:{path}"
+    elif code in {"project_disk_growth_warn", "project_disk_growth_critical"}:
+        fingerprint = f"project_disk_growth:{host}:{project or 'unknown-project'}"
     else:
         digest = hashlib.sha256(f"{code}|{title}|{detail}".encode()).hexdigest()[:24]
         fingerprint = f"alert:{host}:{digest}"
@@ -1155,6 +1177,7 @@ for index, alert in enumerate(alerts):
 PY
 
   local file
+  local -A current_patrol_fingerprints=()
   shopt -s nullglob
   for file in "$tmpdir"/*.json; do
     local fingerprint severity title detail host ts project service
@@ -1206,6 +1229,7 @@ import sys
 print(json.load(open(sys.argv[1]))["service"])
 PY
 )"
+    current_patrol_fingerprints["$fingerprint"]=1
     handle_alert \
       --fingerprint "$fingerprint" \
       --severity "$severity" \
@@ -1216,6 +1240,31 @@ PY
       --title "$title" \
       --detail "$detail" \
       --ts "$ts"
+  done
+  local incident_file incident_fingerprint incident_host incident_project incident_service incident_title
+  for incident_file in "$OPEN_DIR"/*.state; do
+    load_incident_file "$incident_file" || continue
+    [[ "$SOURCE" == "patrol" ]] || continue
+    if [[ -n "$snapshot_host" && -n "$HOST" && "$HOST" != "$snapshot_host" ]]; then
+      continue
+    fi
+    incident_fingerprint="$FINGERPRINT"
+    if [[ -n "${current_patrol_fingerprints[$incident_fingerprint]+x}" ]]; then
+      continue
+    fi
+    incident_host="$HOST"
+    incident_project="$PROJECT"
+    incident_service="$SERVICE"
+    incident_title="$TITLE"
+    handle_recover \
+      --fingerprint "$incident_fingerprint" \
+      --source "patrol" \
+      --host "$incident_host" \
+      --project "$incident_project" \
+      --service "$incident_service" \
+      --title "$incident_title" \
+      --detail "Condition cleared in latest patrol snapshot." \
+      --ts "$snapshot_ts"
   done
   shopt -u nullglob
   rm -rf "$tmpdir"

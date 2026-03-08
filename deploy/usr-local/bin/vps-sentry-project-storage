@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,17 @@ TTL_SECONDS = max(60, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TTL_SECONDS
 TOP_DIR_LIMIT = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_LIMIT", "5")))
 TOP_DIR_DEPTH = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_DEPTH", "2")))
 SCHEMA_VERSION = 2
+HOST_FILESYSTEM_PATH = Path(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_HOST_FS_PATH", "/"))
+HOST_DISK_WARN_PCT = max(1, min(100, int(os.environ.get("VPS_SENTRY_HOST_DISK_WARN_PCT", "85"))))
+HOST_DISK_FAIL_PCT = max(HOST_DISK_WARN_PCT, min(100, int(os.environ.get("VPS_SENTRY_HOST_DISK_FAIL_PCT", "92"))))
+PROJECT_GROWTH_WARN_BYTES = max(0, int(os.environ.get("VPS_SENTRY_PROJECT_GROWTH_WARN_BYTES", str(500 * 1024 * 1024))))
+PROJECT_GROWTH_FAIL_BYTES = max(PROJECT_GROWTH_WARN_BYTES, int(os.environ.get("VPS_SENTRY_PROJECT_GROWTH_FAIL_BYTES", str(1024 * 1024 * 1024))))
+PROJECT_STORAGE_ALERT_CODES = {
+    "host_disk_warn",
+    "host_disk_critical",
+    "project_disk_growth_warn",
+    "project_disk_growth_critical",
+}
 
 BUCKET_DEFS = [
     {
@@ -114,6 +126,35 @@ def parse_iso(ts: object) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def fmt_bytes(value: int | float | None) -> str:
+    if value is None:
+        return "—"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    amount = float(abs(value))
+    unit_index = 0
+    while amount >= 1024 and unit_index < len(units) - 1:
+        amount /= 1024
+        unit_index += 1
+    decimals = 0 if amount >= 10 or unit_index == 0 else 1
+    prefix = "-" if value < 0 else ""
+    return f"{prefix}{amount:.{decimals}f}{units[unit_index]}"
+
+
+def age_label(previous_ts: object, current_ts: object) -> str | None:
+    previous = parse_iso(previous_ts)
+    current = parse_iso(current_ts)
+    if previous is None or current is None:
+        return None
+    delta_seconds = int((current - previous).total_seconds())
+    if delta_seconds <= 0:
+        return None
+    hours = delta_seconds // 3600
+    minutes = (delta_seconds % 3600) // 60
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{max(1, minutes)}m"
 
 
 def run_bytes_command(args: list[str]) -> int:
@@ -258,6 +299,34 @@ def unique_paths(paths: list[Path]) -> list[Path]:
         seen.add(key)
         unique.append(path)
     return unique
+
+
+def measure_host_filesystem() -> dict[str, object]:
+    path = HOST_FILESYSTEM_PATH if HOST_FILESYSTEM_PATH.exists() else Path("/")
+    usage = shutil.disk_usage(str(path))
+    total_bytes = int(usage.total)
+    used_bytes = int(usage.used)
+    available_bytes = int(usage.free)
+    used_percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else None
+
+    if isinstance(used_percent, float) and used_percent >= HOST_DISK_FAIL_PCT:
+        level = "critical"
+    elif isinstance(used_percent, float) and used_percent >= HOST_DISK_WARN_PCT:
+        level = "warn"
+    else:
+        level = "ok"
+
+    return {
+        "path": str(path),
+        "measured_at": iso_utc_now(),
+        "total_bytes": total_bytes,
+        "used_bytes": used_bytes,
+        "available_bytes": available_bytes,
+        "used_percent": used_percent,
+        "warn_percent": HOST_DISK_WARN_PCT,
+        "fail_percent": HOST_DISK_FAIL_PCT,
+        "level": level,
+    }
 
 
 def measure_path(path: Path) -> dict[str, int]:
@@ -409,7 +478,41 @@ def load_projects() -> list[dict[str, object]]:
     return [project for project in projects if isinstance(project, dict)]
 
 
-def build_snapshot() -> dict[str, object]:
+def previous_project_snapshot(previous_snapshot: dict[str, object] | None, project_id: str) -> dict[str, object] | None:
+    if not isinstance(previous_snapshot, dict):
+        return None
+    projects = previous_snapshot.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    previous = projects.get(project_id)
+    return previous if isinstance(previous, dict) else None
+
+
+def project_growth_fields(
+    project_payload: dict[str, object],
+    total_disk: int,
+    total_apparent: int,
+    total_files: int,
+    previous_payload: dict[str, object] | None,
+) -> None:
+    if not isinstance(previous_payload, dict):
+        return
+    previous_measured_at = previous_payload.get("measured_at")
+    if not isinstance(previous_measured_at, str) or not previous_measured_at.strip():
+        return
+    previous_disk = previous_payload.get("disk_bytes")
+    previous_apparent = previous_payload.get("apparent_bytes")
+    previous_files = previous_payload.get("file_count")
+    if not isinstance(previous_disk, int) or not isinstance(previous_apparent, int) or not isinstance(previous_files, int):
+        return
+
+    project_payload["previous_measured_at"] = previous_measured_at
+    project_payload["delta_disk_bytes"] = total_disk - previous_disk
+    project_payload["delta_apparent_bytes"] = total_apparent - previous_apparent
+    project_payload["delta_file_count"] = total_files - previous_files
+
+
+def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[str, object]:
     measured_at = iso_utc_now()
     projects_payload: dict[str, object] = {}
     for project in load_projects():
@@ -477,6 +580,13 @@ def build_snapshot() -> dict[str, object]:
             project_payload["disk_bytes"] = total_disk
             project_payload["apparent_bytes"] = total_apparent
             project_payload["file_count"] = total_files
+            project_growth_fields(
+                project_payload,
+                total_disk,
+                total_apparent,
+                total_files,
+                previous_project_snapshot(previous_snapshot, project_id),
+            )
 
         projects_payload[project_id] = project_payload
 
@@ -487,27 +597,37 @@ def build_snapshot() -> dict[str, object]:
         "top_dirs_limit": TOP_DIR_LIMIT,
         "top_dirs_depth": TOP_DIR_DEPTH,
         "bucket_order": BUCKET_ORDER,
+        "host_filesystem": measure_host_filesystem(),
         "projects": projects_payload,
     }
 
 
-def load_cached_snapshot() -> dict[str, object] | None:
-    if not CACHE_JSON.exists():
+def load_snapshot(path: Path, *, enforce_ttl: bool) -> dict[str, object] | None:
+    if not path.exists():
         return None
     try:
-        payload = json.loads(CACHE_JSON.read_text())
+        payload = json.loads(path.read_text())
     except Exception as exc:
-        log(f"warn: failed to parse cache {CACHE_JSON}: {exc}")
+        log(f"warn: failed to parse snapshot {path}: {exc}")
         return None
     if int(payload.get("schema_version", 0) or 0) != SCHEMA_VERSION:
         return None
     measured_at = parse_iso(payload.get("measured_at"))
     if measured_at is None:
         return None
-    age_seconds = (datetime.now(timezone.utc) - measured_at.astimezone(timezone.utc)).total_seconds()
-    if age_seconds > TTL_SECONDS:
-        return None
+    if enforce_ttl:
+        age_seconds = (datetime.now(timezone.utc) - measured_at.astimezone(timezone.utc)).total_seconds()
+        if age_seconds > TTL_SECONDS:
+            return None
     return payload if isinstance(payload, dict) else None
+
+
+def load_cached_snapshot() -> dict[str, object] | None:
+    return load_snapshot(CACHE_JSON, enforce_ttl=True)
+
+
+def load_previous_snapshot() -> dict[str, object] | None:
+    return load_snapshot(CACHE_JSON, enforce_ttl=False)
 
 
 def write_json(path: Path, payload: dict[str, object], mode: int) -> None:
@@ -520,7 +640,78 @@ def write_json(path: Path, payload: dict[str, object], mode: int) -> None:
     os.replace(tmp_name, path)
 
 
-def merge_into_last(snapshot: dict[str, object]) -> None:
+def build_storage_alerts(snapshot: dict[str, object]) -> list[dict[str, object]]:
+    alerts: list[dict[str, object]] = []
+
+    host_filesystem = snapshot.get("host_filesystem")
+    if isinstance(host_filesystem, dict):
+        used_percent = host_filesystem.get("used_percent")
+        available_bytes = host_filesystem.get("available_bytes")
+        used_bytes = host_filesystem.get("used_bytes")
+        total_bytes = host_filesystem.get("total_bytes")
+        path = str(host_filesystem.get("path") or "/").strip() or "/"
+        if isinstance(used_percent, (int, float)) and isinstance(available_bytes, int) and isinstance(used_bytes, int) and isinstance(total_bytes, int):
+            severity = None
+            code = None
+            if used_percent >= HOST_DISK_FAIL_PCT:
+                severity = "critical"
+                code = "host_disk_critical"
+            elif used_percent >= HOST_DISK_WARN_PCT:
+                severity = "warn"
+                code = "host_disk_warn"
+            if severity and code:
+                alerts.append(
+                    {
+                        "title": "Host disk pressure",
+                        "detail": f"{path} is {used_percent:.1f}% used with {fmt_bytes(available_bytes)} free ({fmt_bytes(used_bytes)} of {fmt_bytes(total_bytes)} used).",
+                        "severity": severity,
+                        "code": code,
+                        "project": "vps-host",
+                        "path": path,
+                    }
+                )
+
+    projects = snapshot.get("projects")
+    if isinstance(projects, dict):
+        for project_id, raw_project in projects.items():
+            if not isinstance(raw_project, dict):
+                continue
+            delta_disk = raw_project.get("delta_disk_bytes")
+            total_disk = raw_project.get("disk_bytes")
+            previous_measured_at = raw_project.get("previous_measured_at")
+            if not isinstance(delta_disk, int) or delta_disk <= 0 or not isinstance(total_disk, int):
+                continue
+            if not isinstance(previous_measured_at, str) or not previous_measured_at.strip():
+                continue
+
+            severity = None
+            code = None
+            if delta_disk >= PROJECT_GROWTH_FAIL_BYTES:
+                severity = "critical"
+                code = "project_disk_growth_critical"
+            elif delta_disk >= PROJECT_GROWTH_WARN_BYTES:
+                severity = "warn"
+                code = "project_disk_growth_warn"
+            if severity is None or code is None:
+                continue
+
+            label = str(raw_project.get("label") or project_id)
+            age = age_label(previous_measured_at, raw_project.get("measured_at"))
+            interval = f" over {age}" if age else ""
+            alerts.append(
+                {
+                    "title": f"{label} disk usage grew sharply",
+                    "detail": f"{label} grew by {fmt_bytes(delta_disk)}{interval} and now uses {fmt_bytes(total_disk)} on tracked project roots.",
+                    "severity": severity,
+                    "code": code,
+                    "project": project_id,
+                }
+            )
+
+    return alerts
+
+
+def merge_into_last(snapshot: dict[str, object], storage_alerts: list[dict[str, object]]) -> None:
     if not LAST_JSON.exists():
         log(f"warn: missing {LAST_JSON}; skipping merge")
         return
@@ -528,6 +719,19 @@ def merge_into_last(snapshot: dict[str, object]) -> None:
     if not isinstance(payload, dict):
         log(f"warn: {LAST_JSON} did not contain an object; skipping merge")
         return
+    existing_alerts = payload.get("alerts")
+    alerts = existing_alerts if isinstance(existing_alerts, list) else []
+    filtered_alerts = []
+    for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+        code = str(alert.get("code") or "").strip()
+        if code in PROJECT_STORAGE_ALERT_CODES:
+            continue
+        filtered_alerts.append(alert)
+    filtered_alerts.extend(storage_alerts)
+    payload["alerts"] = filtered_alerts
+    payload["alerts_count"] = len(filtered_alerts)
     payload["project_storage"] = snapshot
     write_json(LAST_JSON, payload, 0o644)
 
@@ -546,25 +750,29 @@ def main() -> int:
     except Exception as exc:
         log(f"warn: lock unavailable, continuing without it: {exc}")
 
+    previous_snapshot = load_previous_snapshot()
     snapshot = load_cached_snapshot()
     if snapshot is None:
-        snapshot = build_snapshot()
+        snapshot = build_snapshot(previous_snapshot)
         try:
             write_json(CACHE_JSON, snapshot, 0o600)
         except Exception as exc:
             log(f"warn: failed to write cache {CACHE_JSON}: {exc}")
     else:
         log("using cached project storage snapshot")
+        snapshot["host_filesystem"] = measure_host_filesystem()
+
+    storage_alerts = build_storage_alerts(snapshot)
 
     try:
-        merge_into_last(snapshot)
+        merge_into_last(snapshot, storage_alerts)
     except Exception as exc:
         log(f"warn: failed to merge project storage into {LAST_JSON}: {exc}")
         return 0
 
     projects = snapshot.get("projects", {})
     measured_count = len(projects) if isinstance(projects, dict) else 0
-    log(f"ok: merged project storage for {measured_count} project(s)")
+    log(f"ok: merged project storage for {measured_count} project(s) alerts={len(storage_alerts)}")
     return 0
 
 
