@@ -10,6 +10,9 @@ set -euo pipefail
 log()  { echo "[VPS-PUBLISH] $*"; logger -t vps-sentry-publish -- "$*"; }
 fail() { log "FAIL: $*"; exit 2; }
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PORTS_NORMALIZE="$SCRIPT_DIR/vps-sentry-ports-normalize"
+
 STATE="/var/lib/vps-sentry"
 PUB="$STATE/public"
 
@@ -87,6 +90,12 @@ fi
 install -m 0644 -o root -g root "$LAST"   "$PUB/last.json"
 install -m 0644 -o root -g root "$STATUS" "$PUB/status.json"
 install -m 0644 -o root -g root "$DIFF"   "$PUB/diff.json"
+
+# 4) Ensure expected-vs-unexpected public port fields exist even when publish
+#    is invoked manually outside the full systemd post-processing chain.
+if [[ -x "$PORTS_NORMALIZE" ]]; then
+  "$PORTS_NORMALIZE" || log "WARN: ports normalize failed"
+fi
 
 log "OK: published $(stat -c '%s' "$PUB/last.json")B last.json, $(stat -c '%s' "$PUB/status.json")B status.json, $(stat -c '%s' "$PUB/diff.json")B diff.json"
 exit 0
