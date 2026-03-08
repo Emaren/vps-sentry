@@ -303,10 +303,12 @@ def unique_paths(paths: list[Path]) -> list[Path]:
 
 def measure_host_filesystem() -> dict[str, object]:
     path = HOST_FILESYSTEM_PATH if HOST_FILESYSTEM_PATH.exists() else Path("/")
-    usage = shutil.disk_usage(str(path))
-    total_bytes = int(usage.total)
-    used_bytes = int(usage.used)
-    available_bytes = int(usage.free)
+    vfs = os.statvfs(str(path))
+    block_size = int(vfs.f_frsize or vfs.f_bsize or 0)
+    total_bytes = int(vfs.f_blocks * block_size) if block_size > 0 else 0
+    # Match `df` and the live dashboard gauge: only count bytes still available to non-root.
+    available_bytes = int(vfs.f_bavail * block_size) if block_size > 0 else 0
+    used_bytes = max(0, total_bytes - available_bytes)
     used_percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else None
 
     if isinstance(used_percent, float) and used_percent >= HOST_DISK_FAIL_PCT:
