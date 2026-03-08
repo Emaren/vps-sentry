@@ -15,6 +15,85 @@ PROJECTS_FILE = Path(os.environ.get("VPS_SENTRY_PROJECTS_FILE", "/etc/vps-sentry
 TTL_SECONDS = max(60, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TTL_SECONDS", "3600")))
 TOP_DIR_LIMIT = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_LIMIT", "5")))
 TOP_DIR_DEPTH = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_DEPTH", "2")))
+SCHEMA_VERSION = 2
+
+BUCKET_DEFS = [
+    {
+        "id": "dependencies",
+        "label": "Dependencies",
+        "dir_names": {
+            "node_modules",
+            ".venv",
+            "venv",
+            "vendor",
+            "deps",
+            "site-packages",
+        },
+    },
+    {
+        "id": "build_cache",
+        "label": "Build / Cache",
+        "dir_names": {
+            ".next",
+            "dist",
+            "build",
+            ".turbo",
+            "coverage",
+            ".cache",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".parcel-cache",
+            "target",
+        },
+    },
+    {
+        "id": "runtime_data",
+        "label": "Runtime Data",
+        "dir_names": {
+            "storage",
+            "uploads",
+            "tmp",
+            "temp",
+            "run",
+            "runtime",
+            "var",
+            "db",
+            "database",
+        },
+    },
+    {
+        "id": "logs",
+        "label": "Logs",
+        "dir_names": {
+            "logs",
+            "log",
+        },
+    },
+    {
+        "id": "backups_artifacts",
+        "label": "Backups / Artifacts",
+        "dir_names": {
+            "backups",
+            "context",
+            "artifacts",
+            "exports",
+            "archive",
+            "archives",
+            "bundles",
+            "snapshots",
+            "releases",
+        },
+    },
+]
+BUCKET_ORDER = [bucket["id"] for bucket in BUCKET_DEFS] + ["source"]
+BUCKET_LABELS = {bucket["id"]: bucket["label"] for bucket in BUCKET_DEFS} | {"source": "Source"}
+BUCKET_BY_DIR_NAME = {
+    dir_name: bucket["id"]
+    for bucket in BUCKET_DEFS
+    for dir_name in bucket["dir_names"]
+}
 
 
 def log(message: str) -> None:
@@ -45,22 +124,90 @@ def run_bytes_command(args: list[str]) -> int:
 
 
 def count_files(root: Path) -> int:
-    completed = subprocess.run(
-        ["find", str(root), "-xdev", "-type", "f"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return sum(1 for line in completed.stdout.splitlines() if line.strip())
+    try:
+        completed = subprocess.run(
+            ["find", str(root), "-xdev", "-type", "f"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return sum(1 for line in completed.stdout.splitlines() if line.strip())
+    except subprocess.CalledProcessError:
+        return walk_path_usage(root)["file_count"]
+
+
+def walk_path_usage(path: Path) -> dict[str, int]:
+    try:
+        root_stat = path.stat(follow_symlinks=False)
+    except OSError:
+        return {
+            "disk_bytes": 0,
+            "apparent_bytes": 0,
+            "file_count": 0,
+        }
+
+    root_dev = root_stat.st_dev
+    disk_bytes = getattr(root_stat, "st_blocks", 0) * 512 or root_stat.st_size
+    apparent_bytes = root_stat.st_size
+    file_count = 0
+
+    if path.is_file():
+        return {
+            "disk_bytes": disk_bytes,
+            "apparent_bytes": apparent_bytes,
+            "file_count": 1,
+        }
+
+    for dirpath, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+        current_dir = Path(dirpath)
+        kept: list[str] = []
+        for name in dirnames:
+            child = current_dir / name
+            try:
+                if child.is_symlink():
+                    continue
+                st = child.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
+            apparent_bytes += st.st_size
+            kept.append(name)
+        dirnames[:] = kept
+
+        for name in filenames:
+            child = current_dir / name
+            try:
+                if child.is_symlink():
+                    st = child.lstat()
+                else:
+                    st = child.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
+            apparent_bytes += st.st_size
+            file_count += 1
+
+    return {
+        "disk_bytes": disk_bytes,
+        "apparent_bytes": apparent_bytes,
+        "file_count": file_count,
+    }
 
 
 def largest_dirs(root: Path, root_label: str) -> list[dict[str, object]]:
-    completed = subprocess.run(
-        ["du", "-x", "-B1", "-d", str(TOP_DIR_DEPTH), str(root)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ["du", "-x", "-B1", "-d", str(TOP_DIR_DEPTH), str(root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        return []
     entries: list[dict[str, object]] = []
     for line in completed.stdout.splitlines():
         raw = line.strip()
@@ -88,24 +235,162 @@ def largest_dirs(root: Path, root_label: str) -> list[dict[str, object]]:
     return entries[:TOP_DIR_LIMIT]
 
 
-def measure_root(root_path: str) -> dict[str, object]:
+def bucket_template(bucket_id: str) -> dict[str, object]:
+    return {
+        "label": BUCKET_LABELS[bucket_id],
+        "disk_bytes": 0,
+        "apparent_bytes": 0,
+        "file_count": 0,
+        "match_count": 0,
+    }
+
+
+def unique_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def measure_path(path: Path) -> dict[str, int]:
+    try:
+        return {
+            "disk_bytes": run_bytes_command(["du", "-sB1", "-x", str(path)]),
+            "apparent_bytes": run_bytes_command(["du", "-sb", "-x", str(path)]),
+            "file_count": count_files(path),
+        }
+    except subprocess.CalledProcessError:
+        return walk_path_usage(path)
+
+
+def explicit_bucket_paths(root: Path, storage_config: dict[str, object]) -> dict[str, list[Path]]:
+    buckets: dict[str, list[Path]] = {bucket_id: [] for bucket_id in BUCKET_ORDER if bucket_id != "source"}
+    raw_buckets = storage_config.get("buckets")
+    if not isinstance(raw_buckets, dict):
+        return buckets
+
+    for bucket_id, raw_paths in raw_buckets.items():
+        if bucket_id not in buckets or not isinstance(raw_paths, list):
+            continue
+        for raw_path in raw_paths:
+            path_text = str(raw_path).strip()
+            if not path_text:
+                continue
+            candidate = Path(path_text)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if candidate.exists():
+                buckets[bucket_id].append(candidate)
+    return buckets
+
+
+def auto_bucket_paths(root: Path) -> dict[str, list[Path]]:
+    buckets: dict[str, list[Path]] = {bucket_id: [] for bucket_id in BUCKET_ORDER if bucket_id != "source"}
+    try:
+        root_dev = root.stat().st_dev
+    except OSError:
+        return buckets
+
+    for dirpath, dirnames, _filenames in os.walk(root, topdown=True, followlinks=False):
+        current_dir = Path(dirpath)
+        kept: list[str] = []
+        for name in dirnames:
+            child = current_dir / name
+            try:
+                if child.is_symlink():
+                    continue
+                st = child.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            if name in BUCKET_BY_DIR_NAME:
+                buckets[BUCKET_BY_DIR_NAME[name]].append(child)
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+    return buckets
+
+
+def measure_buckets(root: Path, storage_config: dict[str, object]) -> dict[str, dict[str, object]]:
+    discover_buckets = storage_config.get("discover_buckets")
+    should_discover = discover_buckets is not False
+
+    matched_paths: dict[str, list[Path]] = {bucket_id: [] for bucket_id in BUCKET_ORDER if bucket_id != "source"}
+    if should_discover:
+        for bucket_id, paths in auto_bucket_paths(root).items():
+            matched_paths[bucket_id].extend(paths)
+    for bucket_id, paths in explicit_bucket_paths(root, storage_config).items():
+        matched_paths[bucket_id].extend(paths)
+
+    buckets: dict[str, dict[str, object]] = {}
+    for bucket_id in matched_paths:
+        unique = unique_paths(matched_paths[bucket_id])
+        if not unique:
+            continue
+        totals = bucket_template(bucket_id)
+        totals["match_count"] = len(unique)
+        for path in unique:
+            measured = measure_path(path)
+            totals["disk_bytes"] = int(totals["disk_bytes"]) + measured["disk_bytes"]
+            totals["apparent_bytes"] = int(totals["apparent_bytes"]) + measured["apparent_bytes"]
+            totals["file_count"] = int(totals["file_count"]) + measured["file_count"]
+        buckets[bucket_id] = totals
+    return buckets
+
+
+def add_source_bucket(
+    total_disk: int,
+    total_apparent: int,
+    total_files: int,
+    buckets: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    other_disk = sum(int(bucket.get("disk_bytes", 0)) for bucket in buckets.values())
+    other_apparent = sum(int(bucket.get("apparent_bytes", 0)) for bucket in buckets.values())
+    other_files = sum(int(bucket.get("file_count", 0)) for bucket in buckets.values())
+
+    source_bucket = bucket_template("source")
+    source_bucket["disk_bytes"] = max(0, total_disk - other_disk)
+    source_bucket["apparent_bytes"] = max(0, total_apparent - other_apparent)
+    source_bucket["file_count"] = max(0, total_files - other_files)
+    source_bucket["match_count"] = 1 if total_disk > 0 or total_apparent > 0 or total_files > 0 else 0
+    buckets["source"] = source_bucket
+    return buckets
+
+
+def measure_root(root_path: str, storage_config: dict[str, object] | None = None) -> dict[str, object]:
+    storage = storage_config if isinstance(storage_config, dict) else {}
     root = Path(root_path)
     root_label = root.name or root_path.rstrip("/").split("/")[-1] or root_path
     if not root.exists():
         return {
             "label": root_label,
             "exists": False,
+            "buckets": {},
         }
 
-    disk_bytes = run_bytes_command(["du", "-sB1", "-x", str(root)])
-    apparent_bytes = run_bytes_command(["du", "-sb", "-x", str(root)])
-    file_count_value = count_files(root)
+    total = measure_path(root)
+    buckets = add_source_bucket(
+        total["disk_bytes"],
+        total["apparent_bytes"],
+        total["file_count"],
+        measure_buckets(root, storage),
+    )
     return {
         "label": root_label,
         "exists": True,
-        "disk_bytes": disk_bytes,
-        "apparent_bytes": apparent_bytes,
-        "file_count": file_count_value,
+        "disk_bytes": total["disk_bytes"],
+        "apparent_bytes": total["apparent_bytes"],
+        "file_count": total["file_count"],
+        "buckets": buckets,
         "largest_dirs": largest_dirs(root, root_label),
     }
 
@@ -148,9 +433,10 @@ def build_snapshot() -> dict[str, object]:
         total_apparent = 0
         total_files = 0
         roots_present = 0
+        project_buckets: dict[str, dict[str, object]] = {}
 
         for root_path in roots:
-            root_data = measure_root(root_path)
+            root_data = measure_root(root_path, storage)
             measured_roots.append(root_data)
             if not root_data.get("exists"):
                 continue
@@ -159,6 +445,16 @@ def build_snapshot() -> dict[str, object]:
             total_apparent += int(root_data.get("apparent_bytes", 0))
             total_files += int(root_data.get("file_count", 0))
             largest.extend(root_data.get("largest_dirs", []))
+            raw_buckets = root_data.get("buckets")
+            if isinstance(raw_buckets, dict):
+                for bucket_id, raw_bucket in raw_buckets.items():
+                    if bucket_id not in BUCKET_ORDER or not isinstance(raw_bucket, dict):
+                        continue
+                    bucket = project_buckets.setdefault(bucket_id, bucket_template(bucket_id))
+                    bucket["disk_bytes"] = int(bucket.get("disk_bytes", 0)) + int(raw_bucket.get("disk_bytes", 0))
+                    bucket["apparent_bytes"] = int(bucket.get("apparent_bytes", 0)) + int(raw_bucket.get("apparent_bytes", 0))
+                    bucket["file_count"] = int(bucket.get("file_count", 0)) + int(raw_bucket.get("file_count", 0))
+                    bucket["match_count"] = int(bucket.get("match_count", 0)) + int(raw_bucket.get("match_count", 0))
 
         largest.sort(key=lambda item: int(item.get("disk_bytes", 0)), reverse=True)
 
@@ -170,6 +466,11 @@ def build_snapshot() -> dict[str, object]:
             "roots_present": roots_present,
             "roots": measured_roots,
             "largest_dirs": largest[:TOP_DIR_LIMIT],
+            "buckets": {
+                bucket_id: project_buckets[bucket_id]
+                for bucket_id in BUCKET_ORDER
+                if bucket_id in project_buckets
+            },
         }
 
         if roots_present > 0:
@@ -180,10 +481,12 @@ def build_snapshot() -> dict[str, object]:
         projects_payload[project_id] = project_payload
 
     return {
+        "schema_version": SCHEMA_VERSION,
         "measured_at": measured_at,
         "ttl_seconds": TTL_SECONDS,
         "top_dirs_limit": TOP_DIR_LIMIT,
         "top_dirs_depth": TOP_DIR_DEPTH,
+        "bucket_order": BUCKET_ORDER,
         "projects": projects_payload,
     }
 
@@ -195,6 +498,8 @@ def load_cached_snapshot() -> dict[str, object] | None:
         payload = json.loads(CACHE_JSON.read_text())
     except Exception as exc:
         log(f"warn: failed to parse cache {CACHE_JSON}: {exc}")
+        return None
+    if int(payload.get("schema_version", 0) or 0) != SCHEMA_VERSION:
         return None
     measured_at = parse_iso(payload.get("measured_at"))
     if measured_at is None:
