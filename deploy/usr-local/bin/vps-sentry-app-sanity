@@ -251,7 +251,7 @@ done
 
 # Prefer DATABASE_URL from .env.local; fallback to .env if present.
 dburl=""
-if rg -q '^DATABASE_URL=' "$ENV_LOCAL" 2>/dev/null; then
+if [[ -f "$ENV_LOCAL" ]] && rg -q '^DATABASE_URL=' "$ENV_LOCAL" 2>/dev/null; then
   dburl="$(rg -n '^DATABASE_URL=' "$ENV_LOCAL" | head -n 1 | sed -E 's/.*DATABASE_URL="?([^"]+)"?/\1/')"
 elif [[ -f "$ENV_FILE" ]] && rg -q '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null; then
   dburl="$(rg -n '^DATABASE_URL=' "$ENV_FILE" | head -n 1 | sed -E 's/.*DATABASE_URL="?([^"]+)"?/\1/')"
@@ -264,12 +264,23 @@ fi
   "critical" \
   "app_sanity_failed"
 
-# Only support sqlite file: URLs here (otherwise this check isn't applicable)
-if [[ "$dburl" != file:* ]]; then
-  safe_dburl="$(redact_url_secret "$dburl")"
-  clear_marker "$FAIL_MARKER"
-  warn "DATABASE_URL is not sqlite file:... (got: $safe_dburl) (skipping sqlite checks)"
-fi
+db_scheme="${dburl%%:*}"
+
+case "$db_scheme" in
+  file)
+    # SQLite path + schema checks continue below.
+    ;;
+  postgresql|postgres|mysql|mariadb|sqlserver)
+    clear_marker "$FAIL_MARKER"
+    log "OK: service+health+env look sane (DATABASE_URL scheme=$db_scheme; skipping sqlite-specific checks)"
+    exit 0
+    ;;
+  *)
+    safe_dburl="$(redact_url_secret "$dburl")"
+    clear_marker "$FAIL_MARKER"
+    warn "DATABASE_URL uses unsupported scheme '$db_scheme' (got: $safe_dburl) (skipping DB-specific checks)"
+    ;;
+esac
 
 # sqlite path resolution for file: URLs
 dbpath="${dburl#file:}"
