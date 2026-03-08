@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("VPS_SENTRY_STATE_DIR", "/var/lib/vps-sentry"))
+LAST_JSON = STATE_DIR / "last.json"
+CACHE_JSON = STATE_DIR / "project-storage.json"
+LOCK_FILE = STATE_DIR / ".project-storage.lock"
+PROJECTS_FILE = Path(os.environ.get("VPS_SENTRY_PROJECTS_FILE", "/etc/vps-sentry-projects.json"))
+TTL_SECONDS = max(60, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TTL_SECONDS", "3600")))
+TOP_DIR_LIMIT = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_LIMIT", "5")))
+TOP_DIR_DEPTH = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_DEPTH", "2")))
+
+
+def log(message: str) -> None:
+    print(f"[VPS-PROJECT-STORAGE] {message}", file=sys.stderr)
+
+
+def iso_utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(ts: object) -> datetime | None:
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    raw = ts.strip()
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def run_bytes_command(args: list[str]) -> int:
+    completed = subprocess.run(args, check=True, capture_output=True, text=True)
+    first = completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else ""
+    number = first.split(maxsplit=1)[0] if first else ""
+    return int(number)
+
+
+def count_files(root: Path) -> int:
+    completed = subprocess.run(
+        ["find", str(root), "-xdev", "-type", "f"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return sum(1 for line in completed.stdout.splitlines() if line.strip())
+
+
+def largest_dirs(root: Path, root_label: str) -> list[dict[str, object]]:
+    completed = subprocess.run(
+        ["du", "-x", "-B1", "-d", str(TOP_DIR_DEPTH), str(root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    entries: list[dict[str, object]] = []
+    for line in completed.stdout.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            size_text, path_text = raw.split(maxsplit=1)
+            size = int(size_text)
+        except (ValueError, IndexError):
+            continue
+        try:
+            rel = Path(path_text).resolve().relative_to(root.resolve())
+            rel_label = rel.as_posix()
+        except Exception:
+            continue
+        if rel_label in {".", ""}:
+            continue
+        entries.append(
+            {
+                "label": f"{root_label}/{rel_label}",
+                "disk_bytes": size,
+            }
+        )
+    entries.sort(key=lambda item: int(item.get("disk_bytes", 0)), reverse=True)
+    return entries[:TOP_DIR_LIMIT]
+
+
+def measure_root(root_path: str) -> dict[str, object]:
+    root = Path(root_path)
+    root_label = root.name or root_path.rstrip("/").split("/")[-1] or root_path
+    if not root.exists():
+        return {
+            "label": root_label,
+            "exists": False,
+        }
+
+    disk_bytes = run_bytes_command(["du", "-sB1", "-x", str(root)])
+    apparent_bytes = run_bytes_command(["du", "-sb", "-x", str(root)])
+    file_count_value = count_files(root)
+    return {
+        "label": root_label,
+        "exists": True,
+        "disk_bytes": disk_bytes,
+        "apparent_bytes": apparent_bytes,
+        "file_count": file_count_value,
+        "largest_dirs": largest_dirs(root, root_label),
+    }
+
+
+def load_projects() -> list[dict[str, object]]:
+    if not PROJECTS_FILE.exists():
+        return []
+    try:
+        payload = json.loads(PROJECTS_FILE.read_text())
+    except Exception as exc:
+        log(f"warn: failed to parse {PROJECTS_FILE}: {exc}")
+        return []
+    projects = payload.get("projects")
+    if not isinstance(projects, list):
+        return []
+    return [project for project in projects if isinstance(project, dict)]
+
+
+def build_snapshot() -> dict[str, object]:
+    measured_at = iso_utc_now()
+    projects_payload: dict[str, object] = {}
+    for project in load_projects():
+        project_id = str(project.get("id", "")).strip()
+        if not project_id:
+            continue
+        storage = project.get("storage")
+        if not isinstance(storage, dict):
+            continue
+        roots_raw = storage.get("roots")
+        if not isinstance(roots_raw, list):
+            continue
+
+        roots = [str(root).strip() for root in roots_raw if str(root).strip()]
+        if not roots:
+            continue
+
+        measured_roots: list[dict[str, object]] = []
+        largest: list[dict[str, object]] = []
+        total_disk = 0
+        total_apparent = 0
+        total_files = 0
+        roots_present = 0
+
+        for root_path in roots:
+            root_data = measure_root(root_path)
+            measured_roots.append(root_data)
+            if not root_data.get("exists"):
+                continue
+            roots_present += 1
+            total_disk += int(root_data.get("disk_bytes", 0))
+            total_apparent += int(root_data.get("apparent_bytes", 0))
+            total_files += int(root_data.get("file_count", 0))
+            largest.extend(root_data.get("largest_dirs", []))
+
+        largest.sort(key=lambda item: int(item.get("disk_bytes", 0)), reverse=True)
+
+        project_payload: dict[str, object] = {
+            "id": project_id,
+            "label": project.get("label") or project_id,
+            "measured_at": measured_at,
+            "roots_configured": len(roots),
+            "roots_present": roots_present,
+            "roots": measured_roots,
+            "largest_dirs": largest[:TOP_DIR_LIMIT],
+        }
+
+        if roots_present > 0:
+            project_payload["disk_bytes"] = total_disk
+            project_payload["apparent_bytes"] = total_apparent
+            project_payload["file_count"] = total_files
+
+        projects_payload[project_id] = project_payload
+
+    return {
+        "measured_at": measured_at,
+        "ttl_seconds": TTL_SECONDS,
+        "top_dirs_limit": TOP_DIR_LIMIT,
+        "top_dirs_depth": TOP_DIR_DEPTH,
+        "projects": projects_payload,
+    }
+
+
+def load_cached_snapshot() -> dict[str, object] | None:
+    if not CACHE_JSON.exists():
+        return None
+    try:
+        payload = json.loads(CACHE_JSON.read_text())
+    except Exception as exc:
+        log(f"warn: failed to parse cache {CACHE_JSON}: {exc}")
+        return None
+    measured_at = parse_iso(payload.get("measured_at"))
+    if measured_at is None:
+        return None
+    age_seconds = (datetime.now(timezone.utc) - measured_at.astimezone(timezone.utc)).total_seconds()
+    if age_seconds > TTL_SECONDS:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def write_json(path: Path, payload: dict[str, object], mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        tmp_name = handle.name
+    os.chmod(tmp_name, mode)
+    os.replace(tmp_name, path)
+
+
+def merge_into_last(snapshot: dict[str, object]) -> None:
+    if not LAST_JSON.exists():
+        log(f"warn: missing {LAST_JSON}; skipping merge")
+        return
+    payload = json.loads(LAST_JSON.read_text())
+    if not isinstance(payload, dict):
+        log(f"warn: {LAST_JSON} did not contain an object; skipping merge")
+        return
+    payload["project_storage"] = snapshot
+    write_json(LAST_JSON, payload, 0o644)
+
+
+def main() -> int:
+    if not LAST_JSON.exists():
+        log(f"warn: missing {LAST_JSON}; nothing to do")
+        return 0
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_handle = LOCK_FILE.open("a+")
+    try:
+        import fcntl
+
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    except Exception as exc:
+        log(f"warn: lock unavailable, continuing without it: {exc}")
+
+    snapshot = load_cached_snapshot()
+    if snapshot is None:
+        snapshot = build_snapshot()
+        try:
+            write_json(CACHE_JSON, snapshot, 0o600)
+        except Exception as exc:
+            log(f"warn: failed to write cache {CACHE_JSON}: {exc}")
+    else:
+        log("using cached project storage snapshot")
+
+    try:
+        merge_into_last(snapshot)
+    except Exception as exc:
+        log(f"warn: failed to merge project storage into {LAST_JSON}: {exc}")
+        return 0
+
+    projects = snapshot.get("projects", {})
+    measured_count = len(projects) if isinstance(projects, dict) else 0
+    log(f"ok: merged project storage for {measured_count} project(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

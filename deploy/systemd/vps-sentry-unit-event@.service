@@ -1,6 +1,5 @@
-# /etc/systemd/system/vps-sentry-ship.service
 [Unit]
-Description=VPS Sentry ship (send alert bundle)
+Description=VPS Sentry unit event hook for %i
 After=network-online.target
 Wants=network-online.target
 
@@ -12,19 +11,17 @@ Nice=10
 UMask=0077
 
 StateDirectory=vps-sentry
-# 0711 keeps the state root private while allowing non-owner service users to
-# traverse into /var/lib/vps-sentry/public for published dashboard JSON.
 StateDirectoryMode=0711
+RuntimeDirectory=vps-sentry
+RuntimeDirectoryMode=0755
 
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/var/lib/vps-sentry
 Environment=SSH_AUTH_SOCK=
-Environment=VPS_SENTRY_KEY_DIR=/var/lib/vps-sentry/keys
 
-ExecStart=/usr/local/bin/vps-sentry-ship
+ExecStart=/usr/local/bin/vps-sentry-service-event --spec %i
 
-# ---- Hardening (match main service) ----
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -46,9 +43,9 @@ RestrictRealtime=yes
 SystemCallArchitectures=native
 
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/var/lib/vps-sentry
+ReadWritePaths=/var/lib/vps-sentry /run/vps-sentry
 
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=200
 
-TimeoutStartSec=60s
+TimeoutStartSec=45s

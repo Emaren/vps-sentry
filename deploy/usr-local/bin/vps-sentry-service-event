@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${VPS_SENTRY_STATE_DIR:-/var/lib/vps-sentry}"
+NOTIFY_BIN="${VPS_SENTRY_NOTIFY_BIN:-/usr/local/bin/vps-sentry-notify}"
+SYSTEMCTL_BIN="${VPS_SENTRY_SYSTEMCTL_BIN:-systemctl}"
+JOURNALCTL_BIN="${VPS_SENTRY_JOURNALCTL_BIN:-journalctl}"
+PROJECT_META_BIN="${VPS_SENTRY_PROJECT_META_BIN:-/usr/local/bin/vps-sentry-project-meta}"
+
+log() {
+  printf 'vps-sentry-service-event: %s\n' "$*" >&2
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+    return 0
+  fi
+  return 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  vps-sentry-service-event --spec <event__unit>
+  vps-sentry-service-event --event <started|stopped|failed> --unit <unit>
+EOF
+}
+
+load_registry_for_unit() {
+  local unit="$1"
+  local raw=""
+
+  REG_FOUND=0
+  REG_PROJECT=""
+  REG_PROJECT_LABEL=""
+  REG_OPEN_TITLE=""
+  REG_RECOVERY_TITLE=""
+  REG_IMPACT=""
+
+  [[ -x "$PROJECT_META_BIN" ]] || return 0
+  raw="$("$PROJECT_META_BIN" --service "$unit" 2>/dev/null || true)"
+  [[ -n "$raw" ]] || return 0
+  eval "$raw"
+}
+
+project_for_unit() {
+  local unit="$1"
+  load_registry_for_unit "$unit"
+  if [[ "${REG_FOUND:-0}" == "1" && -n "${REG_PROJECT:-}" ]]; then
+    printf '%s' "$REG_PROJECT"
+    return 0
+  fi
+  case "$unit" in
+    vps-sentry-web.service|vps-sentry-ops-worker.service)
+      printf '%s' "vps-sentry"
+      ;;
+    nginx.service|ssh.service|sshd.service)
+      printf '%s' "vps-host"
+      ;;
+    *)
+      printf '%s' "${unit%.service}"
+      ;;
+  esac
+}
+
+open_title_for_unit() {
+  local unit="$1"
+  load_registry_for_unit "$unit"
+  if [[ "${REG_FOUND:-0}" == "1" && -n "${REG_OPEN_TITLE:-}" ]]; then
+    printf '%s' "$REG_OPEN_TITLE"
+    return 0
+  fi
+  case "$unit" in
+    vps-sentry-web.service)
+      printf '%s' "VPS Sentry web service inactive"
+      ;;
+    vps-sentry-ops-worker.service)
+      printf '%s' "VPS Sentry ops worker inactive"
+      ;;
+    nginx.service)
+      printf '%s' "nginx inactive"
+      ;;
+    ssh.service|sshd.service)
+      printf '%s' "SSH service inactive"
+      ;;
+    *)
+      printf '%s' "$unit inactive"
+      ;;
+  esac
+}
+
+recovery_title_for_unit() {
+  local unit="$1"
+  load_registry_for_unit "$unit"
+  if [[ "${REG_FOUND:-0}" == "1" && -n "${REG_RECOVERY_TITLE:-}" ]]; then
+    printf '%s' "$REG_RECOVERY_TITLE"
+    return 0
+  fi
+  case "$unit" in
+    vps-sentry-web.service)
+      printf '%s' "VPS Sentry web service restored"
+      ;;
+    vps-sentry-ops-worker.service)
+      printf '%s' "VPS Sentry ops worker restored"
+      ;;
+    nginx.service)
+      printf '%s' "nginx restored"
+      ;;
+    ssh.service|sshd.service)
+      printf '%s' "SSH service restored"
+      ;;
+    *)
+      printf '%s' "$unit restored"
+      ;;
+  esac
+}
+
+capture_evidence() {
+  local fingerprint="$1"
+  local unit="$2"
+  local evidence_root key evidence_dir
+
+  key="$(printf '%s' "$fingerprint" | sha256_text 2>/dev/null || true)"
+  [[ -n "$key" ]] || die "unable to hash fingerprint"
+
+  evidence_root="$STATE_DIR/incidents/evidence"
+  evidence_dir="$evidence_root/${key:0:40}/$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0700 "$evidence_dir"
+
+  "$SYSTEMCTL_BIN" status "$unit" --no-pager -l >"$evidence_dir/systemctl-status.txt" 2>&1 || true
+  "$SYSTEMCTL_BIN" show "$unit" -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus >"$evidence_dir/systemctl-show.txt" 2>&1 || true
+  "$JOURNALCTL_BIN" -u "$unit" -n 120 --no-pager >"$evidence_dir/journal.txt" 2>&1 || true
+
+  printf '%s\n' "$evidence_dir/systemctl-status.txt" "$evidence_dir/systemctl-show.txt" "$evidence_dir/journal.txt"
+}
+
+event=""
+unit=""
+spec=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --spec)
+      [[ $# -ge 2 ]] || die "missing value for --spec"
+      spec="$2"
+      shift 2
+      ;;
+    --event)
+      [[ $# -ge 2 ]] || die "missing value for --event"
+      event="$2"
+      shift 2
+      ;;
+    --unit)
+      [[ $# -ge 2 ]] || die "missing value for --unit"
+      unit="$2"
+      shift 2
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+if [[ -n "$spec" ]]; then
+  if [[ "$spec" != *__* ]]; then
+    die "invalid spec: $spec"
+  fi
+  event="${spec%%__*}"
+  unit="${spec#*__}"
+fi
+
+case "$event" in
+  started|stopped|failed) ;;
+  *) die "invalid or missing event: $event" ;;
+esac
+[[ -n "$unit" ]] || die "missing unit"
+[[ -x "$NOTIFY_BIN" ]] || die "missing notify helper: $NOTIFY_BIN"
+
+host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
+project="$(project_for_unit "$unit")"
+fingerprint="service_inactive:${host}:${project}:${unit}"
+now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ "$event" == "started" ]]; then
+  if "$SYSTEMCTL_BIN" is-active --quiet "$unit"; then
+    detail="$unit is active again"
+    mapfile -t evidence_paths < <(capture_evidence "$fingerprint" "$unit")
+    cmd=( "$NOTIFY_BIN" recover --fingerprint "$fingerprint" --severity critical --source systemd-hook --host "$host" --project "$project" --service "$unit" --title "$(recovery_title_for_unit "$unit")" --detail "$detail" --ts "$now_iso" )
+    for path in "${evidence_paths[@]}"; do
+      cmd+=( --evidence "$path" )
+    done
+    "${cmd[@]}" || true
+  else
+    log "skip started event for $unit because unit is not active"
+  fi
+  exit 0
+fi
+
+if "$SYSTEMCTL_BIN" is-active --quiet "$unit"; then
+  log "skip $event event for $unit because unit is active"
+  exit 0
+fi
+
+active_state="$("$SYSTEMCTL_BIN" show "$unit" -p ActiveState --value 2>/dev/null || true)"
+sub_state="$("$SYSTEMCTL_BIN" show "$unit" -p SubState --value 2>/dev/null || true)"
+result="$("$SYSTEMCTL_BIN" show "$unit" -p Result --value 2>/dev/null || true)"
+exec_status="$("$SYSTEMCTL_BIN" show "$unit" -p ExecMainStatus --value 2>/dev/null || true)"
+
+detail="$unit event=$event active=${active_state:-unknown} sub=${sub_state:-unknown} result=${result:-unknown} exec_main_status=${exec_status:-unknown}"
+load_registry_for_unit "$unit"
+if [[ "${REG_FOUND:-0}" == "1" && -n "${REG_IMPACT:-}" ]]; then
+  detail="$detail. ${REG_IMPACT}"
+fi
+
+mapfile -t evidence_paths < <(capture_evidence "$fingerprint" "$unit")
+cmd=( "$NOTIFY_BIN" alert --fingerprint "$fingerprint" --severity critical --source systemd-hook --host "$host" --project "$project" --service "$unit" --title "$(open_title_for_unit "$unit")" --detail "$detail" --ts "$now_iso" )
+for path in "${evidence_paths[@]}"; do
+  cmd+=( --evidence "$path" )
+done
+"${cmd[@]}" || true

@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECTS_FILE="${VPS_SENTRY_PROJECTS_FILE:-/etc/vps-sentry-projects.json}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  vps-sentry-project-meta --service <unit>
+  vps-sentry-project-meta --project <id>
+EOF
+}
+
+mode=""
+needle=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --service)
+      [[ $# -ge 2 ]] || { echo "missing value for --service" >&2; exit 1; }
+      mode="service"
+      needle="$2"
+      shift 2
+      ;;
+    --project)
+      [[ $# -ge 2 ]] || { echo "missing value for --project" >&2; exit 1; }
+      mode="project"
+      needle="$2"
+      shift 2
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+[[ -n "$mode" ]] || { usage >&2; exit 1; }
+
+python3 - "$PROJECTS_FILE" "$mode" "$needle" <<'PY'
+import json
+import pathlib
+import shlex
+import sys
+
+path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+needle = sys.argv[3]
+
+defaults = {
+    "REG_FOUND": "0",
+    "REG_PROJECT": "",
+    "REG_PROJECT_LABEL": "",
+    "REG_PUBLIC_URL": "",
+    "REG_SERVICE": "",
+    "REG_SERVICE_LABEL": "",
+    "REG_DOMAIN": "",
+    "REG_HEALTH_URLS": "",
+    "REG_IMPACT": "",
+    "REG_RUNBOOK": "",
+    "REG_SEVERITY": "",
+    "REG_OPEN_TITLE": "",
+    "REG_RECOVERY_TITLE": "",
+}
+
+
+def emit(values):
+    merged = dict(defaults)
+    merged.update(values)
+    for key, value in merged.items():
+        if isinstance(value, list):
+            value = "\n".join(str(item) for item in value if str(item).strip())
+        elif value is None:
+            value = ""
+        else:
+            value = str(value)
+        print(f"{key}={shlex.quote(value)}")
+
+
+if not path.exists():
+    emit({})
+    raise SystemExit(0)
+
+try:
+    payload = json.loads(path.read_text())
+except Exception:
+    emit({})
+    raise SystemExit(0)
+
+projects = payload.get("projects")
+if not isinstance(projects, list):
+    emit({})
+    raise SystemExit(0)
+
+selected_project = None
+selected_service = None
+
+for project in projects:
+    if not isinstance(project, dict):
+        continue
+    if mode == "project" and str(project.get("id", "")).strip() == needle:
+        selected_project = project
+        break
+    if mode != "service":
+        continue
+    services = project.get("services")
+    if not isinstance(services, list):
+        continue
+    for service in services:
+        if not isinstance(service, dict):
+            continue
+        unit = str(service.get("unit", "")).strip()
+        aliases = service.get("aliases")
+        alias_values = []
+        if isinstance(aliases, list):
+            alias_values = [str(item).strip() for item in aliases if str(item).strip()]
+        if needle == unit or needle in alias_values:
+            selected_project = project
+            selected_service = service
+            break
+    if selected_service is not None:
+        break
+
+if selected_project is None:
+    emit({})
+    raise SystemExit(0)
+
+values = {
+    "REG_FOUND": "1",
+    "REG_PROJECT": selected_project.get("id", ""),
+    "REG_PROJECT_LABEL": selected_project.get("label", ""),
+    "REG_PUBLIC_URL": selected_project.get("public_url", ""),
+    "REG_SERVICE": selected_service.get("unit", "") if isinstance(selected_service, dict) else "",
+    "REG_SERVICE_LABEL": selected_service.get("label", "") if isinstance(selected_service, dict) else "",
+    "REG_DOMAIN": (
+        selected_service.get("domain", selected_project.get("domain", ""))
+        if isinstance(selected_service, dict)
+        else selected_project.get("domain", "")
+    ),
+    "REG_HEALTH_URLS": (
+        selected_service.get("health_urls", selected_project.get("health_urls", []))
+        if isinstance(selected_service, dict)
+        else selected_project.get("health_urls", [])
+    ),
+    "REG_IMPACT": (
+        selected_service.get("impact", selected_project.get("impact", ""))
+        if isinstance(selected_service, dict)
+        else selected_project.get("impact", "")
+    ),
+    "REG_RUNBOOK": (
+        selected_service.get("runbook", selected_project.get("runbook", ""))
+        if isinstance(selected_service, dict)
+        else selected_project.get("runbook", "")
+    ),
+    "REG_SEVERITY": (
+        selected_service.get("severity", selected_project.get("severity", ""))
+        if isinstance(selected_service, dict)
+        else selected_project.get("severity", "")
+    ),
+    "REG_OPEN_TITLE": selected_service.get("open_title", "") if isinstance(selected_service, dict) else "",
+    "REG_RECOVERY_TITLE": selected_service.get("recovery_title", "") if isinstance(selected_service, dict) else "",
+}
+emit(values)
+PY

@@ -1,0 +1,1253 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${VPS_SENTRY_STATE_DIR:-/var/lib/vps-sentry}"
+INCIDENT_DIR="${VPS_SENTRY_INCIDENT_DIR:-$STATE_DIR/incidents}"
+OPEN_DIR="$INCIDENT_DIR/open"
+RESOLVED_DIR="$INCIDENT_DIR/resolved"
+INVALID_WEBHOOK_DIR="$STATE_DIR/invalid-webhooks"
+ENV_FILE="${VPS_SENTRY_NOTIFY_ENV_FILE:-/etc/vps-sentry-notify.env}"
+CONFIG_JSON="${VPS_SENTRY_NOTIFY_CONFIG_JSON:-/etc/vps-sentry.json}"
+MAINT_BIN="${VPS_SENTRY_MAINTENANCE_BIN:-/usr/local/bin/vps-sentry-maintenance}"
+CURL_BIN="${VPS_SENTRY_NOTIFY_CURL_BIN:-curl}"
+SENDMAIL_BIN="${VPS_SENTRY_NOTIFY_SENDMAIL_BIN:-sendmail}"
+MAIL_BIN="${VPS_SENTRY_NOTIFY_MAIL_BIN:-mail}"
+PROJECT_META_BIN="${VPS_SENTRY_PROJECT_META_BIN:-/usr/local/bin/vps-sentry-project-meta}"
+
+log() {
+  printf 'vps-sentry-notify: %s\n' "$*" >&2
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+trim() {
+  local value="${1:-}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+safe_source_env_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  [[ ! -L "$file" ]] || die "refusing symlink env file: $file"
+
+  local owner mode mode_dec
+  owner="$(stat -c '%u:%g' "$file" 2>/dev/null || true)"
+  [[ "$owner" == "0:0" ]] || die "unsafe owner for $file (expected root:root)"
+  mode="$(stat -c '%a' "$file" 2>/dev/null || true)"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "unable to read mode for $file"
+  mode_dec=$((8#$mode))
+  (( (mode_dec & 0022) == 0 )) || die "unsafe permissions for $file (must not be group/other writable)"
+
+  # shellcheck disable=SC1090
+  source "$file"
+}
+
+resolve_exec_path() {
+  local candidate="$1"
+  if [[ -x "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  if command -v "$candidate" >/dev/null 2>&1; then
+    command -v "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+    return 0
+  fi
+  return 1
+}
+
+to_epoch() {
+  local raw="${1:-}"
+  if [[ -z "$raw" ]]; then
+    date +%s
+    return 0
+  fi
+  if date -u -d "$raw" +%s >/dev/null 2>&1; then
+    date -u -d "$raw" +%s
+    return 0
+  fi
+  if python3 - "$raw" <<'PY' >/dev/null 2>&1; then
+from datetime import datetime
+import sys
+
+value = sys.argv[1]
+if value.endswith("Z"):
+    value = value[:-1] + "+00:00"
+datetime.fromisoformat(value)
+PY
+    python3 - "$raw" <<'PY'
+from datetime import datetime, timezone
+import sys
+
+value = sys.argv[1]
+if value.endswith("Z"):
+    value = value[:-1] + "+00:00"
+dt = datetime.fromisoformat(value)
+if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=timezone.utc)
+print(int(dt.timestamp()))
+PY
+    return 0
+  fi
+  die "unable to parse timestamp: $raw"
+}
+
+iso_utc_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+ensure_dirs() {
+  # Keep the state root traversable so the web app can read published
+  # dashboard JSON under /var/lib/vps-sentry/public.
+  install -d -m 0711 "$STATE_DIR"
+  install -d -m 0700 "$INCIDENT_DIR"
+  install -d -m 0700 "$OPEN_DIR"
+  install -d -m 0700 "$RESOLVED_DIR"
+  install -d -m 0700 "$INVALID_WEBHOOK_DIR"
+}
+
+split_targets() {
+  local raw="${1:-}"
+  printf '%s\n' "$raw" | sed -e 's/||/\n/g' -e 's/,/\n/g' | while IFS= read -r line; do
+    local target
+    target="$(trim "$line")"
+    [[ -n "$target" ]] || continue
+    printf '%s\n' "$target"
+  done
+}
+
+load_fallback_webhook_urls() {
+  [[ -f "$CONFIG_JSON" ]] || return 0
+  python3 - "$CONFIG_JSON" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    cfg = json.load(open(path, "r"))
+except Exception:
+    raise SystemExit(0)
+
+def is_webhook(value):
+    return isinstance(value, str) and (
+        "discord.com/api/webhooks/" in value or
+        "discordapp.com/api/webhooks/" in value
+    )
+
+def walk(node):
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from walk(value)
+    elif isinstance(node, str):
+        yield node
+
+seen = set()
+for candidate in walk(cfg):
+    if is_webhook(candidate) and candidate not in seen:
+        seen.add(candidate)
+        print(candidate)
+PY
+}
+
+parse_reminder_schedule() {
+  local raw="${VPS_SENTRY_NOTIFY_REMINDER_SCHEDULE:-300,900,3600}"
+  local out=()
+  while IFS= read -r token; do
+    token="$(trim "$token")"
+    [[ -n "$token" ]] || continue
+    [[ "$token" =~ ^[0-9]+$ ]] || die "invalid reminder interval: $token"
+    out+=("$token")
+  done < <(printf '%s\n' "$raw" | sed -e 's/||/\n/g' -e 's/,/\n/g')
+  printf '%s\n' "${out[@]}"
+}
+
+notification_route_for_severity() {
+  local severity="$1"
+  case "$severity" in
+    info) printf '%s' "${VPS_SENTRY_NOTIFY_ROUTE_INFO:-webhook}" ;;
+    warn) printf '%s' "${VPS_SENTRY_NOTIFY_ROUTE_WARN:-both}" ;;
+    critical) printf '%s' "${VPS_SENTRY_NOTIFY_ROUTE_CRITICAL:-both}" ;;
+    *) printf '%s' "${VPS_SENTRY_NOTIFY_ROUTE_CRITICAL:-both}" ;;
+  esac
+}
+
+incident_key_for_fingerprint() {
+  local fingerprint="$1"
+  local key
+  key="$(printf '%s' "$fingerprint" | sha256_text 2>/dev/null || true)"
+  [[ -n "$key" ]] || die "unable to hash fingerprint"
+  printf '%s' "${key:0:40}"
+}
+
+incident_file_for_fingerprint() {
+  local fingerprint="$1"
+  printf '%s/%s.state' "$OPEN_DIR" "$(incident_key_for_fingerprint "$fingerprint")"
+}
+
+resolved_file_for_fingerprint() {
+  local fingerprint="$1"
+  local key
+  key="$(incident_key_for_fingerprint "$fingerprint")"
+  printf '%s/%s-%s.state' "$RESOLVED_DIR" "$key" "$(date -u +%Y%m%dT%H%M%SZ)"
+}
+
+webhook_fingerprint() {
+  local webhook="$1"
+  local fp
+  fp="$(printf '%s' "$webhook" | sha256_text 2>/dev/null || true)"
+  [[ -n "$fp" ]] || die "unable to hash webhook"
+  printf '%s' "$fp"
+}
+
+invalid_webhook_cooldown_seconds() {
+  local raw="${VPS_SENTRY_NOTIFY_INVALID_WEBHOOK_COOLDOWN_SECONDS:-3600}"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+    return 0
+  fi
+  printf '3600'
+}
+
+invalid_webhook_marker_path() {
+  local url="$1"
+  local fp
+  fp="$(webhook_fingerprint "$url")"
+  printf '%s/%s.state' "$INVALID_WEBHOOK_DIR" "${fp:0:40}"
+}
+
+invalid_webhook_is_paused() {
+  local url="$1"
+  local marker_path cooldown marker_ts now_epoch age remain fp
+  marker_path="$(invalid_webhook_marker_path "$url")"
+  [[ -f "$marker_path" ]] || return 1
+
+  marker_ts="$(tr -d '\n' < "$marker_path" 2>/dev/null || true)"
+  [[ "$marker_ts" =~ ^[0-9]+$ ]] || return 1
+
+  cooldown="$(invalid_webhook_cooldown_seconds)"
+  now_epoch="$(date +%s)"
+  age=$(( now_epoch - marker_ts ))
+  if (( age < cooldown )); then
+    remain=$(( cooldown - age ))
+    fp="$(webhook_fingerprint "$url")"
+    log "skip invalid webhook fingerprint=${fp:0:12} retry_in=${remain}s"
+    return 0
+  fi
+
+  rm -f "$marker_path"
+  return 1
+}
+
+mark_invalid_webhook() {
+  local url="$1"
+  local marker_path fp cooldown
+  marker_path="$(invalid_webhook_marker_path "$url")"
+  printf '%s\n' "$(date +%s)" > "$marker_path"
+  chmod 0600 "$marker_path"
+  fp="$(webhook_fingerprint "$url")"
+  cooldown="$(invalid_webhook_cooldown_seconds)"
+  log "pause invalid webhook fingerprint=${fp:0:12} cooldown=${cooldown}s"
+}
+
+clear_invalid_webhook() {
+  local url="$1"
+  rm -f "$(invalid_webhook_marker_path "$url")"
+}
+
+reset_incident_fields() {
+  FINGERPRINT=""
+  SEVERITY="warn"
+  SOURCE=""
+  HOST=""
+  PROJECT=""
+  SERVICE=""
+  PROJECT_LABEL=""
+  SERVICE_LABEL=""
+  PUBLIC_URL=""
+  DOMAIN=""
+  HEALTH_URLS=""
+  IMPACT=""
+  RUNBOOK=""
+  TITLE=""
+  DETAIL=""
+  FIRST_SEEN_TS=""
+  FIRST_SEEN_EPOCH="0"
+  LAST_SEEN_TS=""
+  LAST_SEEN_EPOCH="0"
+  OPEN_NOTIFIED="0"
+  SUPPRESSED="0"
+  SUPPRESSED_REASON=""
+  LAST_NOTIFY_TS=""
+  LAST_NOTIFY_EPOCH="0"
+  LAST_NOTIFY_KIND=""
+  REMINDERS_SENT="0"
+  NOTIFIED_COUNT="0"
+  EVIDENCE_PATHS=""
+  RESOLVED_TS=""
+  RESOLVED_EPOCH="0"
+  DURATION_SECONDS="0"
+}
+
+load_incident_file() {
+  local file="$1"
+  reset_incident_fields
+  [[ -f "$file" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$file"
+  return 0
+}
+
+write_incident_file() {
+  local file="$1"
+  local tmp
+  tmp="$(mktemp)"
+  {
+    printf 'FINGERPRINT=%q\n' "$FINGERPRINT"
+    printf 'SEVERITY=%q\n' "$SEVERITY"
+    printf 'SOURCE=%q\n' "$SOURCE"
+    printf 'HOST=%q\n' "$HOST"
+    printf 'PROJECT=%q\n' "$PROJECT"
+    printf 'SERVICE=%q\n' "$SERVICE"
+    printf 'PROJECT_LABEL=%q\n' "$PROJECT_LABEL"
+    printf 'SERVICE_LABEL=%q\n' "$SERVICE_LABEL"
+    printf 'PUBLIC_URL=%q\n' "$PUBLIC_URL"
+    printf 'DOMAIN=%q\n' "$DOMAIN"
+    printf 'HEALTH_URLS=%q\n' "$HEALTH_URLS"
+    printf 'IMPACT=%q\n' "$IMPACT"
+    printf 'RUNBOOK=%q\n' "$RUNBOOK"
+    printf 'TITLE=%q\n' "$TITLE"
+    printf 'DETAIL=%q\n' "$DETAIL"
+    printf 'FIRST_SEEN_TS=%q\n' "$FIRST_SEEN_TS"
+    printf 'FIRST_SEEN_EPOCH=%q\n' "$FIRST_SEEN_EPOCH"
+    printf 'LAST_SEEN_TS=%q\n' "$LAST_SEEN_TS"
+    printf 'LAST_SEEN_EPOCH=%q\n' "$LAST_SEEN_EPOCH"
+    printf 'OPEN_NOTIFIED=%q\n' "$OPEN_NOTIFIED"
+    printf 'SUPPRESSED=%q\n' "$SUPPRESSED"
+    printf 'SUPPRESSED_REASON=%q\n' "$SUPPRESSED_REASON"
+    printf 'LAST_NOTIFY_TS=%q\n' "$LAST_NOTIFY_TS"
+    printf 'LAST_NOTIFY_EPOCH=%q\n' "$LAST_NOTIFY_EPOCH"
+    printf 'LAST_NOTIFY_KIND=%q\n' "$LAST_NOTIFY_KIND"
+    printf 'REMINDERS_SENT=%q\n' "$REMINDERS_SENT"
+    printf 'NOTIFIED_COUNT=%q\n' "$NOTIFIED_COUNT"
+    printf 'EVIDENCE_PATHS=%q\n' "$EVIDENCE_PATHS"
+    printf 'RESOLVED_TS=%q\n' "$RESOLVED_TS"
+    printf 'RESOLVED_EPOCH=%q\n' "$RESOLVED_EPOCH"
+    printf 'DURATION_SECONDS=%q\n' "$DURATION_SECONDS"
+  } >"$tmp"
+  install -m 0600 "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+append_evidence_path() {
+  local path="$1"
+  path="$(trim "$path")"
+  [[ -n "$path" ]] || return 0
+  if [[ -z "$EVIDENCE_PATHS" ]]; then
+    EVIDENCE_PATHS="$path"
+    return 0
+  fi
+  while IFS= read -r existing; do
+    [[ "$existing" == "$path" ]] && return 0
+  done <<<"$EVIDENCE_PATHS"
+  EVIDENCE_PATHS+=$'\n'"$path"
+}
+
+maintenance_is_active() {
+  local scope="$1"
+  [[ -n "$scope" ]] || return 1
+  [[ -x "$MAINT_BIN" ]] || return 1
+  "$MAINT_BIN" is-active --scope "$scope" >/dev/null 2>&1
+}
+
+format_duration_seconds() {
+  local total="$1"
+  local days hours minutes seconds
+  days=$(( total / 86400 ))
+  hours=$(( (total % 86400) / 3600 ))
+  minutes=$(( (total % 3600) / 60 ))
+  seconds=$(( total % 60 ))
+  if (( days > 0 )); then
+    printf '%sd %sh %sm %ss' "$days" "$hours" "$minutes" "$seconds"
+  elif (( hours > 0 )); then
+    printf '%sh %sm %ss' "$hours" "$minutes" "$seconds"
+  elif (( minutes > 0 )); then
+    printf '%sm %ss' "$minutes" "$seconds"
+  else
+    printf '%ss' "$seconds"
+  fi
+}
+
+enrich_from_registry() {
+  local raw=""
+
+  if [[ -n "$SERVICE" && -x "$PROJECT_META_BIN" ]]; then
+    raw="$("$PROJECT_META_BIN" --service "$SERVICE" 2>/dev/null || true)"
+  elif [[ -n "$PROJECT" && -x "$PROJECT_META_BIN" ]]; then
+    raw="$("$PROJECT_META_BIN" --project "$PROJECT" 2>/dev/null || true)"
+  else
+    return 0
+  fi
+
+  [[ -n "$raw" ]] || return 0
+  eval "$raw"
+  [[ "${REG_FOUND:-0}" == "1" ]] || return 0
+
+  [[ -n "$PROJECT" ]] || PROJECT="${REG_PROJECT:-}"
+  [[ -n "$PROJECT_LABEL" ]] || PROJECT_LABEL="${REG_PROJECT_LABEL:-}"
+  [[ -n "$SERVICE_LABEL" ]] || SERVICE_LABEL="${REG_SERVICE_LABEL:-}"
+  [[ -n "$PUBLIC_URL" ]] || PUBLIC_URL="${REG_PUBLIC_URL:-}"
+  [[ -n "$DOMAIN" ]] || DOMAIN="${REG_DOMAIN:-}"
+  [[ -n "$HEALTH_URLS" ]] || HEALTH_URLS="${REG_HEALTH_URLS:-}"
+  [[ -n "$IMPACT" ]] || IMPACT="${REG_IMPACT:-}"
+  [[ -n "$RUNBOOK" ]] || RUNBOOK="${REG_RUNBOOK:-}"
+}
+
+display_project_name() {
+  if [[ -n "$PROJECT_LABEL" && -n "$PROJECT" && "$PROJECT_LABEL" != "$PROJECT" ]]; then
+    printf '%s (%s)' "$PROJECT_LABEL" "$PROJECT"
+    return 0
+  fi
+  if [[ -n "$PROJECT_LABEL" ]]; then
+    printf '%s' "$PROJECT_LABEL"
+    return 0
+  fi
+  if [[ -n "$PROJECT" ]]; then
+    printf '%s' "$PROJECT"
+    return 0
+  fi
+  printf '%s' "unknown"
+}
+
+display_service_name() {
+  if [[ -n "$SERVICE_LABEL" && -n "$SERVICE" && "$SERVICE_LABEL" != "$SERVICE" ]]; then
+    printf '%s (%s)' "$SERVICE_LABEL" "$SERVICE"
+    return 0
+  fi
+  if [[ -n "$SERVICE_LABEL" ]]; then
+    printf '%s' "$SERVICE_LABEL"
+    return 0
+  fi
+  if [[ -n "$SERVICE" ]]; then
+    printf '%s' "$SERVICE"
+    return 0
+  fi
+  printf '%s' "n/a"
+}
+
+format_list_block() {
+  local raw="$1"
+  if [[ -z "$raw" ]]; then
+    printf '%s' "n/a"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf -- '- %s\n' "$line"
+  done <<<"$raw"
+}
+
+summarize_evidence_path() {
+  local path="$1"
+  local base
+  [[ -f "$path" ]] || return 0
+  base="$(basename "$path")"
+  case "$base" in
+    journal.txt)
+      tail -n 20 "$path" 2>/dev/null || true
+      ;;
+    systemctl-show.txt)
+      sed -n '1,20p' "$path" 2>/dev/null || true
+      ;;
+    *)
+      sed -n '1,25p' "$path" 2>/dev/null || true
+      ;;
+  esac
+}
+
+build_evidence_excerpt() {
+  local path count=0 snippet base
+  [[ -n "$EVIDENCE_PATHS" ]] || return 0
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    [[ -f "$path" ]] || continue
+    snippet="$(summarize_evidence_path "$path")"
+    [[ -n "$snippet" ]] || continue
+    base="$(basename "$path")"
+    printf '[%s]\n%s\n' "$base" "$snippet"
+    count=$(( count + 1 ))
+    if (( count >= 3 )); then
+      break
+    fi
+    printf '\n'
+  done <<<"$EVIDENCE_PATHS"
+}
+
+build_subject() {
+  local kind="$1"
+  case "$kind" in
+    open)
+      printf '[VPS Sentry] %s: %s' "${SEVERITY^^}" "$TITLE"
+      ;;
+    reminder)
+      printf '[VPS Sentry] REMINDER: %s' "$TITLE"
+      ;;
+    recovery)
+      printf '[VPS Sentry] RECOVERY: %s' "$TITLE"
+      ;;
+    *)
+      printf '[VPS Sentry] %s' "$TITLE"
+      ;;
+  esac
+}
+
+build_body() {
+  local kind="$1"
+  local now_iso="$2"
+  local duration_label=""
+  local evidence_block=""
+  local evidence_excerpt=""
+  local project_display=""
+  local service_display=""
+  local public_url_value=""
+  local domain_value=""
+  local health_block=""
+  local impact_block=""
+  local runbook_block=""
+
+  if [[ "$kind" == "recovery" ]]; then
+    duration_label="$(format_duration_seconds "$DURATION_SECONDS")"
+  else
+    duration_label="$(format_duration_seconds "$(( $(to_epoch "$now_iso") - FIRST_SEEN_EPOCH ))")"
+  fi
+
+  project_display="$(display_project_name)"
+  service_display="$(display_service_name)"
+  public_url_value="${PUBLIC_URL:-n/a}"
+  domain_value="${DOMAIN:-n/a}"
+  if [[ -n "$HEALTH_URLS" ]]; then
+    health_block=$'\n'"Health checks:"$'\n'"$(format_list_block "$HEALTH_URLS")"
+  fi
+  if [[ -n "$IMPACT" ]]; then
+    impact_block=$'\n'"Impact:"$'\n'"$IMPACT"
+  fi
+  if [[ -n "$RUNBOOK" ]]; then
+    runbook_block=$'\n'"First checks:"$'\n'"$RUNBOOK"
+  fi
+  if [[ -n "$EVIDENCE_PATHS" ]]; then
+    evidence_block=$'\n'"Evidence files:"$'\n'"$EVIDENCE_PATHS"
+    evidence_excerpt="$(build_evidence_excerpt)"
+    if [[ -n "$evidence_excerpt" ]]; then
+      evidence_block+=$'\n\n'"Evidence summary:"$'\n'"$evidence_excerpt"
+    fi
+  fi
+
+  case "$kind" in
+    open)
+      cat <<EOF
+Host: $HOST
+Project: $project_display
+Service: $service_display
+Unit: ${SERVICE:-n/a}
+Severity: $SEVERITY
+Source: ${SOURCE:-unknown}
+Public URL: $public_url_value
+Domain: $domain_value
+First seen: $FIRST_SEEN_TS
+Last seen: $LAST_SEEN_TS
+Fingerprint: $FINGERPRINT
+$health_block$impact_block$runbook_block
+
+Title:
+$TITLE
+
+Detail:
+$DETAIL
+$evidence_block
+EOF
+      ;;
+    reminder)
+      cat <<EOF
+Host: $HOST
+Project: $project_display
+Service: $service_display
+Unit: ${SERVICE:-n/a}
+Severity: $SEVERITY
+Source: ${SOURCE:-unknown}
+Public URL: $public_url_value
+Domain: $domain_value
+First seen: $FIRST_SEEN_TS
+Last seen: $LAST_SEEN_TS
+Open for: $duration_label
+Fingerprint: $FINGERPRINT
+$health_block$impact_block$runbook_block
+
+Title:
+$TITLE
+
+Detail:
+$DETAIL
+$evidence_block
+EOF
+      ;;
+    recovery)
+      cat <<EOF
+Host: $HOST
+Project: $project_display
+Service: $service_display
+Unit: ${SERVICE:-n/a}
+Severity: $SEVERITY
+Source: ${SOURCE:-unknown}
+Public URL: $public_url_value
+Domain: $domain_value
+Opened: $FIRST_SEEN_TS
+Recovered: $RESOLVED_TS
+Outage duration: $duration_label
+Fingerprint: $FINGERPRINT
+$health_block$impact_block$runbook_block
+
+Recovery:
+$DETAIL
+$evidence_block
+EOF
+      ;;
+  esac
+}
+
+build_webhook_payload() {
+  local url="$1"
+  local kind="$2"
+  local subject="$3"
+  local body="$4"
+  local now_iso="$5"
+  python3 - "$url" "$kind" "$subject" "$body" "$HOST" "$SEVERITY" "$SERVICE" "$PROJECT" "$now_iso" <<'PY'
+import json
+import sys
+
+url, kind, subject, body, host, severity, service, project, ts = sys.argv[1:]
+body = body.strip()
+subject = subject.strip()
+
+if "discord.com/api/webhooks/" in url or "discordapp.com/api/webhooks/" in url:
+    content = f"{subject}\nHost: {host}\nProject: {project or 'unknown'}\nService: {service or 'n/a'}\n\n{body}"
+    content = content[:1900]
+    print(json.dumps({"content": content}))
+else:
+    print(
+        json.dumps(
+            {
+                "type": "vps_sentry.incident",
+                "kind": kind,
+                "severity": severity,
+                "host": host,
+                "project": project,
+                "service": service,
+                "title": subject,
+                "detail": body,
+                "ts": ts,
+            }
+        )
+    )
+PY
+}
+
+send_webhook() {
+  local url="$1"
+  local payload="$2"
+  local response_path output fp
+  fp="$(webhook_fingerprint "$url")"
+  if invalid_webhook_is_paused "$url"; then
+    return 2
+  fi
+  response_path="$(mktemp)"
+  set +e
+  output="$("$CURL_BIN" -sS -o "$response_path" -w '%{http_code}' --max-time "${VPS_SENTRY_NOTIFY_CURL_TIMEOUT_SECONDS:-10}" -X POST -H 'content-type: application/json' --data "$payload" "$url" 2>&1)"
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 0 && "$output" =~ ^2[0-9][0-9]$ ]]; then
+    clear_invalid_webhook "$url"
+    rm -f "$response_path"
+    return 0
+  fi
+  log "webhook delivery failed fingerprint=${fp:0:12} http=${output:-000}"
+  if [[ -s "$response_path" ]]; then
+    local response_excerpt
+    response_excerpt="$(head -c 300 "$response_path" | tr '\n' ' ' | tr '\r' ' ')"
+    log "webhook response fingerprint=${fp:0:12}: $response_excerpt"
+    if [[ "${output:-}" == "404" ]] && [[ "$response_excerpt" == *"Unknown Webhook"* || "$response_excerpt" == *"\"code\":10015"* ]]; then
+      mark_invalid_webhook "$url"
+    fi
+  fi
+  rm -f "$response_path"
+  return 1
+}
+
+send_email_with_sendmail() {
+  local to="$1"
+  local subject="$2"
+  local body="$3"
+  local sendmail_path
+  sendmail_path="$(resolve_exec_path "$SENDMAIL_BIN" || true)"
+  [[ -n "$sendmail_path" ]] || return 1
+  local from="${VPS_SENTRY_NOTIFY_EMAIL_FROM:-vps-sentry@localhost}"
+  {
+    printf 'From: %s\n' "$from"
+    printf 'To: %s\n' "$to"
+    printf 'Subject: %s\n' "$subject"
+    printf 'Content-Type: text/plain; charset=UTF-8\n'
+    printf '\n'
+    printf '%s\n' "$body"
+  } | "$sendmail_path" -t
+}
+
+send_email_with_mail() {
+  local to="$1"
+  local subject="$2"
+  local body="$3"
+  command -v "$MAIL_BIN" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$body" | "$MAIL_BIN" -s "$subject" "$to"
+}
+
+send_email_with_smtp() {
+  local to="$1"
+  local subject="$2"
+  local body="$3"
+  local server="${VPS_SENTRY_NOTIFY_EMAIL_SERVER:-}"
+  local from="${VPS_SENTRY_NOTIFY_EMAIL_FROM:-}"
+  [[ -n "$server" ]] || return 1
+  [[ -n "$from" ]] || return 1
+  python3 - "$server" "$from" "$to" "$subject" "$body" <<'PY'
+import re
+import smtplib
+import ssl
+import sys
+import urllib.parse
+from email.message import EmailMessage
+
+server_url, sender, to_raw, subject, body = sys.argv[1:]
+parsed = urllib.parse.urlparse(server_url)
+if parsed.scheme not in {"smtp", "smtps"}:
+    raise SystemExit(1)
+
+host = parsed.hostname
+if not host:
+    raise SystemExit(1)
+
+port = parsed.port or (465 if parsed.scheme == "smtps" else 587)
+username = urllib.parse.unquote(parsed.username or "")
+password = urllib.parse.unquote(parsed.password or "")
+
+recipients = [item.strip() for item in re.split(r"(?:,|\n|\|\|)+", to_raw) if item.strip()]
+if not recipients:
+    raise SystemExit(1)
+
+msg = EmailMessage()
+msg["From"] = sender
+msg["To"] = ", ".join(recipients)
+msg["Subject"] = subject
+msg.set_content(body)
+
+if parsed.scheme == "smtps" or port == 465:
+    with smtplib.SMTP_SSL(host, port, timeout=15, context=ssl.create_default_context()) as client:
+        if username:
+            client.login(username, password)
+        client.send_message(msg)
+else:
+    with smtplib.SMTP(host, port, timeout=15) as client:
+        client.ehlo()
+        starttls_raw = parsed.query or ""
+        use_starttls = "starttls=0" not in starttls_raw and "starttls=false" not in starttls_raw.lower()
+        if use_starttls:
+            client.starttls(context=ssl.create_default_context())
+            client.ehlo()
+        if username:
+            client.login(username, password)
+        client.send_message(msg)
+PY
+}
+
+send_email() {
+  local to="$1"
+  local subject="$2"
+  local body="$3"
+  local provider="${VPS_SENTRY_NOTIFY_EMAIL_PROVIDER:-auto}"
+  case "$provider" in
+    smtp)
+      send_email_with_smtp "$to" "$subject" "$body"
+      ;;
+    sendmail)
+      send_email_with_sendmail "$to" "$subject" "$body" || send_email_with_mail "$to" "$subject" "$body"
+      ;;
+    auto)
+      send_email_with_smtp "$to" "$subject" "$body" || send_email_with_sendmail "$to" "$subject" "$body" || send_email_with_mail "$to" "$subject" "$body"
+      ;;
+    *)
+      die "invalid email provider: $provider"
+      ;;
+  esac
+}
+
+deliver_notification() {
+  local kind="$1"
+  local now_iso="$2"
+  local route want_webhook=0 want_email=0 webhook_sent=0 webhook_failed=0 webhook_skipped=0 email_sent=0 email_failed=0
+  local subject body payload webhook_url
+
+  route="$(notification_route_for_severity "$SEVERITY")"
+  case "$route" in
+    none) log "skip delivery route=none fingerprint=$FINGERPRINT"; return 0 ;;
+    webhook) want_webhook=1 ;;
+    email) want_email=1 ;;
+    both) want_webhook=1; want_email=1 ;;
+    *) die "invalid notify route: $route" ;;
+  esac
+
+  subject="$(build_subject "$kind")"
+  body="$(build_body "$kind" "$now_iso")"
+
+  if (( want_webhook )); then
+    if [[ -z "$(trim "${VPS_SENTRY_NOTIFY_WEBHOOK_URLS:-}")" ]]; then
+      webhook_failed=1
+      log "webhook route selected but no webhook URLs are configured"
+    else
+      while IFS= read -r webhook_url; do
+        [[ -n "$webhook_url" ]] || continue
+        payload="$(build_webhook_payload "$webhook_url" "$kind" "$subject" "$body" "$now_iso")"
+        if send_webhook "$webhook_url" "$payload"; then
+          webhook_sent=$(( webhook_sent + 1 ))
+        else
+          case "$?" in
+            2) webhook_skipped=$(( webhook_skipped + 1 )) ;;
+            *) webhook_failed=$(( webhook_failed + 1 )) ;;
+          esac
+        fi
+      done < <(split_targets "${VPS_SENTRY_NOTIFY_WEBHOOK_URLS:-}")
+    fi
+  fi
+
+  if (( want_email )); then
+    if [[ -z "$(trim "${VPS_SENTRY_NOTIFY_EMAIL_TO:-}")" ]]; then
+      email_failed=1
+      log "email route selected but no recipients are configured"
+    elif send_email "${VPS_SENTRY_NOTIFY_EMAIL_TO}" "$subject" "$body"; then
+      email_sent=1
+    else
+      email_failed=1
+      log "email delivery failed for fingerprint=$FINGERPRINT"
+    fi
+  fi
+
+  local attempted success failed
+  attempted=$(( webhook_sent + webhook_failed + email_sent + email_failed ))
+  success=$(( webhook_sent + email_sent ))
+  failed=$(( webhook_failed + email_failed ))
+
+  if (( attempted == 0 )); then
+    if (( webhook_skipped > 0 && success > 0 )); then
+      return 0
+    fi
+    log "no delivery attempts were made for fingerprint=$FINGERPRINT"
+    return 1
+  fi
+  if (( success == 0 && failed > 0 )); then
+    return 1
+  fi
+  if (( failed > 0 )); then
+    log "partial delivery fingerprint=$FINGERPRINT success=$success failed=$failed"
+  fi
+  return 0
+}
+
+reminder_due() {
+  local now_epoch="$1"
+  local cooldown="${VPS_SENTRY_NOTIFY_COOLDOWN_SECONDS:-300}"
+  [[ "$OPEN_NOTIFIED" == "1" ]] || return 1
+  [[ "$REMINDERS_SENT" =~ ^[0-9]+$ ]] || REMINDERS_SENT=0
+  [[ "$LAST_NOTIFY_EPOCH" =~ ^[0-9]+$ ]] || LAST_NOTIFY_EPOCH=0
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=300
+
+  mapfile -t REMINDER_STEPS < <(parse_reminder_schedule)
+  (( ${#REMINDER_STEPS[@]} > 0 )) || return 1
+  (( REMINDERS_SENT < ${#REMINDER_STEPS[@]} )) || return 1
+
+  local threshold="${REMINDER_STEPS[$REMINDERS_SENT]}"
+  (( now_epoch - FIRST_SEEN_EPOCH >= threshold )) || return 1
+  (( now_epoch - LAST_NOTIFY_EPOCH >= cooldown )) || return 1
+  return 0
+}
+
+status_command() {
+  ensure_dirs
+  local count=0 file
+  shopt -s nullglob
+  for file in "$OPEN_DIR"/*.state; do
+    count=$(( count + 1 ))
+    load_incident_file "$file" || continue
+    printf '%s\t%s\t%s\t%s\t%s\n' "$SEVERITY" "$HOST" "$SERVICE" "$FIRST_SEEN_TS" "$TITLE"
+  done
+  shopt -u nullglob
+  if (( count == 0 )); then
+    printf 'no-open-incidents\n'
+  fi
+}
+
+handle_alert() {
+  local fingerprint="" severity="critical" source="host-agent" host="" project="" service="" title="" detail="" ts="" evidence=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fingerprint) fingerprint="$2"; shift 2 ;;
+      --severity) severity="$2"; shift 2 ;;
+      --source) source="$2"; shift 2 ;;
+      --host) host="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --service) service="$2"; shift 2 ;;
+      --title) title="$2"; shift 2 ;;
+      --detail) detail="$2"; shift 2 ;;
+      --ts) ts="$2"; shift 2 ;;
+      --evidence) evidence+=("$2"); shift 2 ;;
+      *) die "unknown alert argument: $1" ;;
+    esac
+  done
+
+  fingerprint="$(trim "$fingerprint")"
+  [[ -n "$fingerprint" ]] || die "--fingerprint is required"
+  title="$(trim "$title")"
+  [[ -n "$title" ]] || die "--title is required"
+  detail="$(trim "$detail")"
+  host="$(trim "$host")"
+  [[ -n "$host" ]] || host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-host)"
+  project="$(trim "$project")"
+  service="$(trim "$service")"
+  ts="${ts:-$(iso_utc_now)}"
+
+  ensure_dirs
+  local incident_file existing=0 now_iso now_epoch event_epoch suppression_scope=""
+  now_iso="$(iso_utc_now)"
+  now_epoch="$(to_epoch "$now_iso")"
+  event_epoch="$(to_epoch "$ts")"
+  incident_file="$(incident_file_for_fingerprint "$fingerprint")"
+  if load_incident_file "$incident_file"; then
+    existing=1
+  fi
+
+  if (( existing == 0 )); then
+    reset_incident_fields
+    FINGERPRINT="$fingerprint"
+    FIRST_SEEN_TS="$ts"
+    FIRST_SEEN_EPOCH="$event_epoch"
+  fi
+
+  FINGERPRINT="$fingerprint"
+  SEVERITY="$severity"
+  SOURCE="$source"
+  HOST="$host"
+  PROJECT="$project"
+  SERVICE="$service"
+  TITLE="$title"
+  DETAIL="$detail"
+  LAST_SEEN_TS="$ts"
+  LAST_SEEN_EPOCH="$event_epoch"
+  enrich_from_registry
+  for path in "${evidence[@]}"; do
+    append_evidence_path "$path"
+  done
+
+  if [[ -n "$SERVICE" ]] && maintenance_is_active "$SERVICE"; then
+    suppression_scope="$SERVICE"
+  elif [[ -n "$PROJECT" ]] && maintenance_is_active "$PROJECT"; then
+    suppression_scope="$PROJECT"
+  elif maintenance_is_active "all"; then
+    suppression_scope="all"
+  fi
+
+  if [[ -n "$suppression_scope" ]]; then
+    SUPPRESSED="1"
+    SUPPRESSED_REASON="maintenance:$suppression_scope"
+    write_incident_file "$incident_file"
+    log "suppressed fingerprint=$FINGERPRINT scope=$suppression_scope"
+    return 0
+  fi
+
+  SUPPRESSED="0"
+  SUPPRESSED_REASON=""
+
+  local send_kind=""
+  if [[ "$OPEN_NOTIFIED" != "1" ]]; then
+    send_kind="open"
+  elif reminder_due "$now_epoch"; then
+    send_kind="reminder"
+  fi
+
+  if [[ -n "$send_kind" ]]; then
+    if deliver_notification "$send_kind" "$now_iso"; then
+      OPEN_NOTIFIED="1"
+      LAST_NOTIFY_TS="$now_iso"
+      LAST_NOTIFY_EPOCH="$now_epoch"
+      LAST_NOTIFY_KIND="$send_kind"
+      NOTIFIED_COUNT="$(( NOTIFIED_COUNT + 1 ))"
+      if [[ "$send_kind" == "reminder" ]]; then
+        REMINDERS_SENT="$(( REMINDERS_SENT + 1 ))"
+      fi
+    fi
+  fi
+
+  write_incident_file "$incident_file"
+}
+
+handle_recover() {
+  local fingerprint="" severity="critical" source="systemd-hook" host="" project="" service="" title="" detail="" ts="" evidence=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fingerprint) fingerprint="$2"; shift 2 ;;
+      --severity) severity="$2"; shift 2 ;;
+      --source) source="$2"; shift 2 ;;
+      --host) host="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --service) service="$2"; shift 2 ;;
+      --title) title="$2"; shift 2 ;;
+      --detail) detail="$2"; shift 2 ;;
+      --ts) ts="$2"; shift 2 ;;
+      --evidence) evidence+=("$2"); shift 2 ;;
+      *) die "unknown recover argument: $1" ;;
+    esac
+  done
+
+  fingerprint="$(trim "$fingerprint")"
+  [[ -n "$fingerprint" ]] || die "--fingerprint is required"
+  local incident_file resolved_file now_iso now_epoch
+  incident_file="$(incident_file_for_fingerprint "$fingerprint")"
+  load_incident_file "$incident_file" || return 0
+
+  now_iso="${ts:-$(iso_utc_now)}"
+  now_epoch="$(to_epoch "$now_iso")"
+  if [[ -n "$(trim "$severity")" ]]; then
+    SEVERITY="$severity"
+  fi
+  if [[ -n "$(trim "$source")" ]]; then
+    SOURCE="$source"
+  fi
+  if [[ -n "$(trim "$host")" ]]; then
+    HOST="$host"
+  fi
+  if [[ -n "$(trim "$project")" ]]; then
+    PROJECT="$project"
+  fi
+  if [[ -n "$(trim "$service")" ]]; then
+    SERVICE="$service"
+  fi
+  if [[ -n "$(trim "$title")" ]]; then
+    TITLE="$title"
+  fi
+  if [[ -n "$(trim "$detail")" ]]; then
+    DETAIL="$detail"
+  fi
+  enrich_from_registry
+  for path in "${evidence[@]}"; do
+    append_evidence_path "$path"
+  done
+
+  RESOLVED_TS="$now_iso"
+  RESOLVED_EPOCH="$now_epoch"
+  if [[ "$FIRST_SEEN_EPOCH" =~ ^[0-9]+$ ]] && (( FIRST_SEEN_EPOCH > 0 )); then
+    DURATION_SECONDS="$(( now_epoch - FIRST_SEEN_EPOCH ))"
+  else
+    DURATION_SECONDS="0"
+  fi
+
+  if [[ "$OPEN_NOTIFIED" == "1" ]]; then
+    deliver_notification "recovery" "$now_iso" || true
+  fi
+
+  resolved_file="$(resolved_file_for_fingerprint "$fingerprint")"
+  write_incident_file "$resolved_file"
+  rm -f "$incident_file"
+}
+
+handle_ship_last() {
+  local last_json="$STATE_DIR/last.json"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --last-json)
+        [[ $# -ge 2 ]] || die "missing value for --last-json"
+        last_json="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown ship-last argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -f "$last_json" ]] || die "missing last.json: $last_json"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  python3 - "$last_json" "$tmpdir" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+last_path = pathlib.Path(sys.argv[1])
+out_dir = pathlib.Path(sys.argv[2])
+payload = json.loads(last_path.read_text())
+alerts = payload.get("alerts")
+if not isinstance(alerts, list):
+    raise SystemExit(0)
+
+host = (payload.get("host") or "").strip()
+ts = (payload.get("ts") or "").strip()
+
+for index, alert in enumerate(alerts):
+    if not isinstance(alert, dict):
+        continue
+    severity = (alert.get("severity") or "warn").strip() or "warn"
+    code = (alert.get("code") or "").strip()
+    title = (alert.get("title") or "Host alert").strip()
+    detail = (alert.get("detail") or "").strip()
+    project = ""
+    service = ""
+    if code in {"app_service_inactive", "app_healthz_failed", "app_readyz_failed", "app_sanity_failed", "app_public_status_unreadable"}:
+        project = "vps-sentry"
+        service = "vps-sentry-web.service"
+    if code == "app_service_inactive":
+        fingerprint = f"service_inactive:{host}:{project}:{service}"
+    elif code == "app_healthz_failed":
+        fingerprint = f"service_healthz_failed:{host}:{project}:{service}"
+    elif code == "app_readyz_failed":
+        fingerprint = f"service_readyz_failed:{host}:{project}:{service}"
+    elif code == "app_public_status_unreadable":
+        fingerprint = f"service_public_status_unreadable:{host}:{project}:{service}"
+    elif code == "app_sanity_failed":
+        fingerprint = f"service_sanity_failed:{host}:{project}:{service or 'vps-sentry-web'}"
+    else:
+        digest = hashlib.sha256(f"{code}|{title}|{detail}".encode()).hexdigest()[:24]
+        fingerprint = f"alert:{host}:{digest}"
+
+    row = {
+        "fingerprint": fingerprint,
+        "severity": severity,
+        "title": title,
+        "detail": detail,
+        "host": host,
+        "ts": ts,
+        "project": project,
+        "service": service,
+    }
+    (out_dir / f"{index:04d}.json").write_text(json.dumps(row))
+PY
+
+  local file
+  shopt -s nullglob
+  for file in "$tmpdir"/*.json; do
+    local fingerprint severity title detail host ts project service
+    fingerprint="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["fingerprint"])
+PY
+)"
+    severity="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["severity"])
+PY
+)"
+    title="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["title"])
+PY
+)"
+    detail="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["detail"])
+PY
+)"
+    host="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["host"])
+PY
+)"
+    ts="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["ts"])
+PY
+)"
+    project="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["project"])
+PY
+)"
+    service="$(python3 - "$file" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))["service"])
+PY
+)"
+    handle_alert \
+      --fingerprint "$fingerprint" \
+      --severity "$severity" \
+      --source "patrol" \
+      --host "$host" \
+      --project "$project" \
+      --service "$service" \
+      --title "$title" \
+      --detail "$detail" \
+      --ts "$ts"
+  done
+  shopt -u nullglob
+  rm -rf "$tmpdir"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  vps-sentry-notify ship-last [--last-json /var/lib/vps-sentry/last.json]
+  vps-sentry-notify alert --fingerprint <fp> --severity <level> --title <title> --detail <detail> [--source <source>] [--host <host>] [--project <project>] [--service <unit>] [--ts <iso>] [--evidence <path>]
+  vps-sentry-notify recover --fingerprint <fp> [--severity <level>] [--title <title>] [--detail <detail>] [--source <source>] [--host <host>] [--project <project>] [--service <unit>] [--ts <iso>] [--evidence <path>]
+  vps-sentry-notify status
+EOF
+}
+
+safe_source_env_file "$ENV_FILE"
+if [[ -z "$(trim "${VPS_SENTRY_NOTIFY_WEBHOOK_URLS:-}")" ]]; then
+  VPS_SENTRY_NOTIFY_WEBHOOK_URLS="$(load_fallback_webhook_urls || true)"
+fi
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || {
+  usage >&2
+  exit 1
+}
+shift || true
+
+case "$cmd" in
+  ship-last) handle_ship_last "$@" ;;
+  alert) handle_alert "$@" ;;
+  recover) handle_recover "$@" ;;
+  status) status_command ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; die "unknown command: $cmd" ;;
+esac

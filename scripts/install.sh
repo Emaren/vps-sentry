@@ -70,10 +70,18 @@ fi
 DEFAULT_RUNTIME="/opt/vps-sentry/venv/bin/vps-sentry"
 RUNTIME_BIN="${VPS_SENTRY_RUNTIME:-$DEFAULT_RUNTIME}"
 UNIT_SRC_DIR="deploy/systemd"
+ETC_SRC_DIR="deploy/etc"
+SUDOERS_SRC_DIR="deploy/etc/sudoers.d"
 RUNTIME_CORE_SOURCE="runtime/vps_sentry/core_legacy.py"
 
 if [[ ! -d "$UNIT_SRC_DIR" ]]; then
   die "missing unit source directory: $UNIT_SRC_DIR"
+fi
+if [[ ! -d "$ETC_SRC_DIR" ]]; then
+  die "missing config source directory: $ETC_SRC_DIR"
+fi
+if [[ ! -d "$SUDOERS_SRC_DIR" ]]; then
+  die "missing sudoers source directory: $SUDOERS_SRC_DIR"
 fi
 if [[ ! -f "$RUNTIME_CORE_SOURCE" ]]; then
   die "missing runtime core source file: $RUNTIME_CORE_SOURCE"
@@ -158,9 +166,12 @@ sudo install -m 0644 "$RUNTIME_CORE_SOURCE" "$RUNTIME_CORE_TARGET"
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry.service"      /etc/systemd/system/vps-sentry.service
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry.timer"        /etc/systemd/system/vps-sentry.timer
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-ship.service" /etc/systemd/system/vps-sentry-ship.service
+sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-unit-event@.service" /etc/systemd/system/vps-sentry-unit-event@.service
 
 sudo install -d -m 0755 /etc/systemd/system/vps-sentry.service.d
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry.service.d/90-post.conf" /etc/systemd/system/vps-sentry.service.d/90-post.conf
+sudo install -d -m 0755 /etc/systemd/system/vps-sentry-ship.service.d
+sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-ship.service.d/zz-public-state-dir.conf" /etc/systemd/system/vps-sentry-ship.service.d/zz-public-state-dir.conf
 if sudo test -f /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf; then
   if ! sudo cmp -s "$UNIT_SRC_DIR/vps-sentry.service.d/95-expected-ports.conf" /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf; then
     warn "existing /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf differs; leaving in place"
@@ -170,6 +181,28 @@ if sudo test -f /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf;
 else
   sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry.service.d/95-expected-ports.conf" /etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf
 fi
+
+if sudo test -f /etc/vps-sentry-projects.json; then
+  if ! sudo cmp -s "$ETC_SRC_DIR/vps-sentry-projects.json" /etc/vps-sentry-projects.json; then
+    warn "existing /etc/vps-sentry-projects.json differs; leaving in place"
+  else
+    sudo install -m 0644 "$ETC_SRC_DIR/vps-sentry-projects.json" /etc/vps-sentry-projects.json
+  fi
+else
+  sudo install -m 0644 "$ETC_SRC_DIR/vps-sentry-projects.json" /etc/vps-sentry-projects.json
+fi
+
+sudo install -d -m 0755 /etc/sudoers.d
+sudo install -m 0440 "$SUDOERS_SRC_DIR/90-vps-sentry-maintenance" /etc/sudoers.d/90-vps-sentry-maintenance
+
+sudo install -d -m 0755 /etc/systemd/system/vps-sentry-web.service.d
+sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-web.service.d/10-vps-sentry-events.conf" /etc/systemd/system/vps-sentry-web.service.d/10-vps-sentry-events.conf
+sudo install -d -m 0755 /etc/systemd/system/vps-sentry-ops-worker.service.d
+sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-ops-worker.service.d/10-vps-sentry-events.conf" /etc/systemd/system/vps-sentry-ops-worker.service.d/10-vps-sentry-events.conf
+sudo install -d -m 0755 /etc/systemd/system/nginx.service.d
+sudo install -m 0644 "$UNIT_SRC_DIR/nginx.service.d/10-vps-sentry-events.conf" /etc/systemd/system/nginx.service.d/10-vps-sentry-events.conf
+sudo install -d -m 0755 /etc/systemd/system/ssh.service.d
+sudo install -m 0644 "$UNIT_SRC_DIR/ssh.service.d/10-vps-sentry-events.conf" /etc/systemd/system/ssh.service.d/10-vps-sentry-events.conf
 
 # Remove a legacy ship.conf drop-in that clears ExecStartPost and can disable
 # other host-specific ExecStartPost hooks (publish/normalize/etc).

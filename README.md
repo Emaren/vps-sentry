@@ -2,6 +2,11 @@
 
 Tiny VPS security monitor + "ship" hook, designed for systemd.
 
+There is also an off-box external sentinel stub at `bin/vps-sentry-external-sentinel`.
+It is not installed by `scripts/install.sh`; it is meant to run from the MBP or a future second VPS.
+The MBP installer now copies that watcher into a fixed bundle under `~/Library/Application Support/VPSSentry/external-sentinel/`
+so launchd is not executing directly from a mutable repo checkout.
+
 ## What it does
 
 Runs on a systemd timer (default: every 5 minutes):
@@ -209,14 +214,53 @@ Binaries (installed):
 * `/usr/local/bin/vps-sentry-ports-normalize`
 * `/usr/local/bin/vps-sentry-evidence-seal`
 * `/usr/local/bin/vps-sentry-evidence-verify`
+* `/usr/local/bin/vps-sentry-notify`
+* `/usr/local/bin/vps-sentry-service-event`
+* `/usr/local/bin/vps-sentry-maintenance`
+
+Off-box helper (not installed by `scripts/install.sh`):
+
+* `bin/vps-sentry-external-sentinel`
+* docs: `docs/external-sentinel-stub.md`
+* MBP launchd installer: `scripts/install-external-sentinel-mbp.sh`
+* MBP launchd removal: `scripts/uninstall-external-sentinel-mbp.sh`
+* MBP fixed install path: `~/Library/Application Support/VPSSentry/external-sentinel/`
 
 Systemd units (installed):
 
 * `/etc/systemd/system/vps-sentry.service`
 * `/etc/systemd/system/vps-sentry.timer`
 * `/etc/systemd/system/vps-sentry-ship.service`
+* `/etc/systemd/system/vps-sentry-unit-event@.service`
 * `/etc/systemd/system/vps-sentry.service.d/90-post.conf`
 * `/etc/systemd/system/vps-sentry.service.d/95-expected-ports.conf` (installed if missing; existing customized file is preserved)
+* `/etc/systemd/system/vps-sentry-web.service.d/10-vps-sentry-events.conf`
+* `/etc/systemd/system/vps-sentry-ops-worker.service.d/10-vps-sentry-events.conf`
+* `/etc/systemd/system/nginx.service.d/10-vps-sentry-events.conf`
+* `/etc/systemd/system/ssh.service.d/10-vps-sentry-events.conf`
+* `/etc/vps-sentry-projects.json`
+* `/etc/sudoers.d/90-vps-sentry-maintenance`
+
+Host-side notify config:
+
+* `/etc/vps-sentry-notify.env`
+* `/etc/vps-sentry-projects.json`
+* `VPS_SENTRY_NOTIFY_EMAIL_PROVIDER=auto|smtp|sendmail`
+* `VPS_SENTRY_NOTIFY_EMAIL_SERVER=smtp://user:pass@smtp.example.com:587`
+* `VPS_SENTRY_NOTIFY_EMAIL_FROM=...`
+* `VPS_SENTRY_NOTIFY_EMAIL_TO=addr1@example.com,addr2@example.com`
+* `VPS_SENTRY_NOTIFY_WEBHOOK_URLS=https://...`
+* `VPS_SENTRY_NOTIFY_ROUTE_INFO=webhook`
+* `VPS_SENTRY_NOTIFY_ROUTE_WARN=both`
+* `VPS_SENTRY_NOTIFY_ROUTE_CRITICAL=both`
+* `VPS_SENTRY_NOTIFY_REMINDER_SCHEDULE=300,900,3600`
+* `VPS_SENTRY_NOTIFY_COOLDOWN_SECONDS=300`
+
+Planned restart suppression:
+
+* `sudo vps-sentry-maintenance start --scope vps-sentry-web.service --ttl 10m --reason deploy`
+* restart/deploy the service
+* `sudo vps-sentry-maintenance stop --scope vps-sentry-web.service`
 
 State (runtime):
 

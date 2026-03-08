@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+
+ENV_FILE="${VPS_SENTRY_EXTERNAL_SENTINEL_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/vps-sentry/external-sentinel.env}"
+STATE_DIR=""
+MODE=""
+NAME=""
+URL=""
+EXPECTED_STATUS=""
+FAILURE_THRESHOLD=""
+TIMEOUT_SECONDS=""
+PROJECT=""
+CHECK_KIND=""
+NOTIFY_BIN=""
+CURL_BIN=""
+STATUS_FILE=""
+
+log() {
+  printf 'vps-sentry-external-sentinel: %s\n' "$*" >&2
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+trim() {
+  local value="${1:-}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+ensure_positive_int() {
+  local name="$1"
+  local value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a positive integer: $value"
+  (( value > 0 )) || die "$name must be > 0: $value"
+}
+
+resolve_notify_bin() {
+  local candidate
+  for candidate in \
+    "${NOTIFY_BIN:-}" \
+    "$ROOT_DIR/bin/vps-sentry-notify" \
+    "$ROOT_DIR/deploy/usr-local/bin/vps-sentry-notify" \
+    "/usr/local/bin/vps-sentry-notify"
+  do
+    [[ -n "$candidate" ]] || continue
+    if [[ -x "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+source_env_if_present() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+}
+
+init_config() {
+  STATE_DIR="${VPS_SENTRY_EXTERNAL_SENTINEL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/vps-sentry/external-sentinel}"
+  MODE="${VPS_SENTRY_EXTERNAL_SENTINEL_MODE:-stub}"
+  NAME="${VPS_SENTRY_EXTERNAL_SENTINEL_NAME:-vps-sentry-edge}"
+  URL="${VPS_SENTRY_EXTERNAL_SENTINEL_URL:-}"
+  EXPECTED_STATUS="${VPS_SENTRY_EXTERNAL_SENTINEL_EXPECTED_STATUS:-200}"
+  FAILURE_THRESHOLD="${VPS_SENTRY_EXTERNAL_SENTINEL_CONSECUTIVE_FAILURES:-2}"
+  TIMEOUT_SECONDS="${VPS_SENTRY_EXTERNAL_SENTINEL_TIMEOUT_SECONDS:-10}"
+  PROJECT="${VPS_SENTRY_EXTERNAL_SENTINEL_PROJECT:-vps-sentry}"
+  CHECK_KIND="${VPS_SENTRY_EXTERNAL_SENTINEL_CHECK_KIND:-http}"
+  NOTIFY_BIN="${VPS_SENTRY_EXTERNAL_SENTINEL_NOTIFY_BIN:-}"
+  CURL_BIN="${VPS_SENTRY_EXTERNAL_SENTINEL_CURL_BIN:-curl}"
+  STATUS_FILE="$STATE_DIR/status.env"
+}
+
+ensure_state_dir() {
+  install -d -m 0700 "$STATE_DIR"
+}
+
+iso_now() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+url_host() {
+  python3 - "$1" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+value = sys.argv[1].strip()
+if not value:
+    raise SystemExit(1)
+
+parsed = urlparse(value)
+host = parsed.hostname or ""
+print(host)
+PY
+}
+
+status_reset() {
+  LAST_CHECK_TS=""
+  LAST_CHECK_RESULT="unknown"
+  LAST_HTTP_CODE=""
+  LAST_ERROR=""
+  LAST_OK_TS=""
+  FIRST_FAILURE_TS=""
+  LAST_FAILURE_TS=""
+  CONSECUTIVE_FAILURES="0"
+  OPEN_INCIDENT="0"
+  LAST_NOTIFY_ACTION=""
+  LAST_NOTIFY_TS=""
+  LAST_NOTIFY_MODE=""
+}
+
+status_load() {
+  status_reset
+  [[ -f "$STATUS_FILE" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$STATUS_FILE"
+}
+
+status_save() {
+  local tmp
+  tmp="$(mktemp)"
+  {
+    printf 'LAST_CHECK_TS=%q\n' "$LAST_CHECK_TS"
+    printf 'LAST_CHECK_RESULT=%q\n' "$LAST_CHECK_RESULT"
+    printf 'LAST_HTTP_CODE=%q\n' "$LAST_HTTP_CODE"
+    printf 'LAST_ERROR=%q\n' "$LAST_ERROR"
+    printf 'LAST_OK_TS=%q\n' "$LAST_OK_TS"
+    printf 'FIRST_FAILURE_TS=%q\n' "$FIRST_FAILURE_TS"
+    printf 'LAST_FAILURE_TS=%q\n' "$LAST_FAILURE_TS"
+    printf 'CONSECUTIVE_FAILURES=%q\n' "$CONSECUTIVE_FAILURES"
+    printf 'OPEN_INCIDENT=%q\n' "$OPEN_INCIDENT"
+    printf 'LAST_NOTIFY_ACTION=%q\n' "$LAST_NOTIFY_ACTION"
+    printf 'LAST_NOTIFY_TS=%q\n' "$LAST_NOTIFY_TS"
+    printf 'LAST_NOTIFY_MODE=%q\n' "$LAST_NOTIFY_MODE"
+  } >"$tmp"
+  install -m 0600 "$tmp" "$STATUS_FILE"
+  rm -f "$tmp"
+}
+
+build_fingerprint() {
+  local host="$1"
+  printf 'external-sentinel:%s:%s:%s' "$NAME" "$CHECK_KIND" "$host"
+}
+
+notify_action() {
+  local action="$1"
+  local host="$2"
+  local title="$3"
+  local detail="$4"
+  local fingerprint="$5"
+  local now_ts="$6"
+  local notify_path
+  local notify_state_dir notify_env_file
+
+  notify_state_dir="$STATE_DIR/notify"
+  notify_env_file="$STATE_DIR/notify.env.missing"
+
+  notify_path="$(resolve_notify_bin || true)"
+  if [[ "$MODE" == "stub" ]]; then
+    log "stub: would ${action} fingerprint=$fingerprint title=$title"
+    LAST_NOTIFY_ACTION="stub-${action}"
+    LAST_NOTIFY_TS="$now_ts"
+    LAST_NOTIFY_MODE="$MODE"
+    return 0
+  fi
+
+  [[ "$MODE" == "active" ]] || die "invalid mode: $MODE (expected stub or active)"
+  [[ -n "$notify_path" ]] || die "unable to resolve vps-sentry-notify"
+
+  if [[ "$action" == "alert" ]]; then
+    VPS_SENTRY_STATE_DIR="$notify_state_dir" \
+    VPS_SENTRY_NOTIFY_ENV_FILE="$notify_env_file" \
+    "$notify_path" alert \
+      --fingerprint "$fingerprint" \
+      --severity critical \
+      --source external-sentinel \
+      --host "$host" \
+      --project "$PROJECT" \
+      --service "$URL" \
+      --title "$title" \
+      --detail "$detail" \
+      --ts "$now_ts"
+  else
+    VPS_SENTRY_STATE_DIR="$notify_state_dir" \
+    VPS_SENTRY_NOTIFY_ENV_FILE="$notify_env_file" \
+    "$notify_path" recover \
+      --fingerprint "$fingerprint" \
+      --severity critical \
+      --source external-sentinel \
+      --host "$host" \
+      --project "$PROJECT" \
+      --service "$URL" \
+      --title "$title" \
+      --detail "$detail" \
+      --ts "$now_ts"
+  fi
+
+  LAST_NOTIFY_ACTION="$action"
+  LAST_NOTIFY_TS="$now_ts"
+  LAST_NOTIFY_MODE="$MODE"
+}
+
+run_http_check() {
+  local response_path error_path curl_output curl_rc http_code
+  response_path="$(mktemp)"
+  error_path="$(mktemp)"
+
+  set +e
+  curl_output="$("$CURL_BIN" -sS -o "$response_path" -w '%{http_code}' --max-time "$TIMEOUT_SECONDS" "$URL" 2>"$error_path")"
+  curl_rc=$?
+  set -e
+
+  http_code="$curl_output"
+  if [[ "$curl_rc" -eq 0 && "$http_code" == "$EXPECTED_STATUS" ]]; then
+    rm -f "$response_path" "$error_path"
+    printf 'ok\t%s\t\n' "$http_code"
+    return 0
+  fi
+
+  local detail
+  if [[ "$curl_rc" -ne 0 ]]; then
+    detail="$(tr '\n' ' ' <"$error_path" | sed 's/[[:space:]]\+/ /g' | sed 's/^ //; s/ $//')"
+    detail="${detail:-curl exit $curl_rc}"
+  else
+    detail="unexpected http status: $http_code (expected $EXPECTED_STATUS)"
+  fi
+
+  rm -f "$response_path" "$error_path"
+  printf 'fail\t%s\t%s\n' "${http_code:-000}" "$detail"
+}
+
+command_check() {
+  ensure_positive_int "VPS_SENTRY_EXTERNAL_SENTINEL_EXPECTED_STATUS" "$EXPECTED_STATUS"
+  ensure_positive_int "VPS_SENTRY_EXTERNAL_SENTINEL_CONSECUTIVE_FAILURES" "$FAILURE_THRESHOLD"
+  ensure_positive_int "VPS_SENTRY_EXTERNAL_SENTINEL_TIMEOUT_SECONDS" "$TIMEOUT_SECONDS"
+  URL="$(trim "$URL")"
+  [[ -n "$URL" ]] || die "VPS_SENTRY_EXTERNAL_SENTINEL_URL is required"
+
+  local host now_ts fingerprint result http_code error_detail
+  host="$(url_host "$URL" || true)"
+  [[ -n "$host" ]] || host="$NAME"
+  fingerprint="$(build_fingerprint "$host")"
+  now_ts="$(iso_now)"
+
+  ensure_state_dir
+  status_load
+
+  IFS=$'\t' read -r result http_code error_detail < <(run_http_check)
+  LAST_CHECK_TS="$now_ts"
+  LAST_HTTP_CODE="$http_code"
+
+  if [[ "$result" == "ok" ]]; then
+    LAST_CHECK_RESULT="ok"
+    LAST_ERROR=""
+    LAST_OK_TS="$now_ts"
+    CONSECUTIVE_FAILURES="0"
+    if [[ "$OPEN_INCIDENT" == "1" ]]; then
+      notify_action \
+        "recover" \
+        "$host" \
+        "External sentinel recovered: $NAME" \
+        "HTTP check to $URL recovered with status $http_code" \
+        "$fingerprint" \
+        "$now_ts"
+    fi
+    OPEN_INCIDENT="0"
+    status_save
+    printf 'ok name=%s url=%s status=%s mode=%s open_incident=%s\n' "$NAME" "$URL" "$http_code" "$MODE" "$OPEN_INCIDENT"
+    return 0
+  fi
+
+  LAST_CHECK_RESULT="fail"
+  LAST_ERROR="$error_detail"
+  LAST_FAILURE_TS="$now_ts"
+  if [[ -z "$FIRST_FAILURE_TS" || "$CONSECUTIVE_FAILURES" == "0" ]]; then
+    FIRST_FAILURE_TS="$now_ts"
+  fi
+  CONSECUTIVE_FAILURES="$(( CONSECUTIVE_FAILURES + 1 ))"
+
+  if (( CONSECUTIVE_FAILURES >= FAILURE_THRESHOLD )); then
+    if [[ "$OPEN_INCIDENT" != "1" ]]; then
+      notify_action \
+        "alert" \
+        "$host" \
+        "External sentinel failed: $NAME" \
+        "HTTP check to $URL failed with status ${http_code:-000}. Error: ${error_detail:-unknown}. Threshold=$FAILURE_THRESHOLD consecutive failures." \
+        "$fingerprint" \
+        "$now_ts"
+    fi
+    OPEN_INCIDENT="1"
+  fi
+
+  status_save
+  printf 'fail name=%s url=%s status=%s consecutive_failures=%s threshold=%s mode=%s open_incident=%s\n' \
+    "$NAME" "$URL" "${http_code:-000}" "$CONSECUTIVE_FAILURES" "$FAILURE_THRESHOLD" "$MODE" "$OPEN_INCIDENT"
+  return 1
+}
+
+command_status() {
+  ensure_state_dir
+  status_load
+  printf 'name=%s\n' "$NAME"
+  printf 'mode=%s\n' "$MODE"
+  printf 'url=%s\n' "$URL"
+  printf 'last_check_ts=%s\n' "${LAST_CHECK_TS:-}"
+  printf 'last_check_result=%s\n' "${LAST_CHECK_RESULT:-unknown}"
+  printf 'last_http_code=%s\n' "${LAST_HTTP_CODE:-}"
+  printf 'last_error=%s\n' "${LAST_ERROR:-}"
+  printf 'last_ok_ts=%s\n' "${LAST_OK_TS:-}"
+  printf 'first_failure_ts=%s\n' "${FIRST_FAILURE_TS:-}"
+  printf 'last_failure_ts=%s\n' "${LAST_FAILURE_TS:-}"
+  printf 'consecutive_failures=%s\n' "${CONSECUTIVE_FAILURES:-0}"
+  printf 'open_incident=%s\n' "${OPEN_INCIDENT:-0}"
+  printf 'last_notify_action=%s\n' "${LAST_NOTIFY_ACTION:-}"
+  printf 'last_notify_ts=%s\n' "${LAST_NOTIFY_TS:-}"
+  printf 'last_notify_mode=%s\n' "${LAST_NOTIFY_MODE:-}"
+}
+
+command_example_env() {
+  cat <<'EOF'
+# Copy to ~/.config/vps-sentry/external-sentinel.env on the off-box runner.
+# Leave mode=stub until you are ready to page from the MBP or a second VPS.
+VPS_SENTRY_EXTERNAL_SENTINEL_MODE=stub
+VPS_SENTRY_EXTERNAL_SENTINEL_NAME=vps-sentry-edge
+VPS_SENTRY_EXTERNAL_SENTINEL_URL=https://vps-sentry.tokentap.ca/
+VPS_SENTRY_EXTERNAL_SENTINEL_EXPECTED_STATUS=200
+VPS_SENTRY_EXTERNAL_SENTINEL_CONSECUTIVE_FAILURES=2
+VPS_SENTRY_EXTERNAL_SENTINEL_TIMEOUT_SECONDS=10
+VPS_SENTRY_EXTERNAL_SENTINEL_PROJECT=vps-sentry
+
+# Reuse the same notify transport model when you switch to active mode.
+VPS_SENTRY_NOTIFY_EMAIL_PROVIDER=smtp
+VPS_SENTRY_NOTIFY_EMAIL_SERVER=smtp://user:pass@smtp.gmail.com:587
+VPS_SENTRY_NOTIFY_EMAIL_FROM=VPS Sentry <alerts@example.com>
+VPS_SENTRY_NOTIFY_EMAIL_TO=you@example.com
+VPS_SENTRY_NOTIFY_ROUTE_CRITICAL=email
+EOF
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  vps-sentry-external-sentinel check
+  vps-sentry-external-sentinel status
+  vps-sentry-external-sentinel example-env
+
+Notes:
+  - This runner is intentionally off-box. It is not installed by scripts/install.sh.
+  - Default mode is "stub": it records incident state but does not page.
+  - Set VPS_SENTRY_EXTERNAL_SENTINEL_MODE=active when you are ready to deliver alerts.
+EOF
+}
+
+source_env_if_present
+init_config
+
+cmd="${1:-check}"
+case "$cmd" in
+  check)
+    shift || true
+    command_check "$@"
+    ;;
+  status)
+    shift || true
+    command_status "$@"
+    ;;
+  example-env)
+    shift || true
+    command_example_env "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $cmd"
+    ;;
+esac

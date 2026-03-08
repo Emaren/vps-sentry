@@ -16,8 +16,12 @@ TOOLS=(
   vps-sentry-app-sanity
   vps-sentry-evidence-seal
   vps-sentry-evidence-verify
+  vps-sentry-maintenance
+  vps-sentry-notify
   vps-sentry-ports-normalize
   vps-sentry-publish
+  vps-sentry-project-meta
+  vps-sentry-service-event
   vps-sentry-selftest
   vps-sentry-ship
   vps-sentry-status-merge

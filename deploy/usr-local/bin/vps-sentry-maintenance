@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_DIR="${VPS_SENTRY_RUN_DIR:-/run/vps-sentry}"
+MAINT_DIR="$RUN_DIR/maintenance"
+
+log() {
+  printf 'vps-sentry-maintenance: %s\n' "$*" >&2
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+trim() {
+  local value="${1:-}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+sha256_text() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+    return 0
+  fi
+  return 1
+}
+
+scope_key() {
+  local scope="$1"
+  local key
+  key="$(printf '%s' "$scope" | sha256_text 2>/dev/null || true)"
+  [[ -n "$key" ]] || die "unable to hash scope"
+  printf '%s' "$key"
+}
+
+parse_ttl_seconds() {
+  local raw
+  raw="$(trim "${1:-}")"
+  [[ -n "$raw" ]] || die "ttl is required"
+
+  local num suffix mult=1
+  if [[ "$raw" =~ ^([0-9]+)([smhd]?)$ ]]; then
+    num="${BASH_REMATCH[1]}"
+    suffix="${BASH_REMATCH[2]}"
+  else
+    die "invalid ttl: $raw (expected 600, 10m, 1h, 1d)"
+  fi
+
+  case "$suffix" in
+    ""|s) mult=1 ;;
+    m) mult=60 ;;
+    h) mult=3600 ;;
+    d) mult=86400 ;;
+    *) die "invalid ttl suffix: $suffix" ;;
+  esac
+
+  printf '%s' "$(( num * mult ))"
+}
+
+ensure_dirs() {
+  install -d -m 0755 "$RUN_DIR"
+  install -d -m 0755 "$MAINT_DIR"
+}
+
+cleanup_expired() {
+  ensure_dirs
+  python3 - "$MAINT_DIR" "$(date +%s)" <<'PY'
+import json
+import pathlib
+import sys
+
+maint_dir = pathlib.Path(sys.argv[1])
+now = int(sys.argv[2])
+
+for path in maint_dir.glob("*.json"):
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        path.unlink(missing_ok=True)
+        continue
+    expires = int(payload.get("expires_epoch") or 0)
+    if expires <= 0 or expires <= now:
+        path.unlink(missing_ok=True)
+PY
+}
+
+write_token() {
+  local scope="$1"
+  local ttl_seconds="$2"
+  local reason="$3"
+  local created_epoch expires_epoch tmp key target
+
+  created_epoch="$(date +%s)"
+  expires_epoch="$(( created_epoch + ttl_seconds ))"
+  key="$(scope_key "$scope")"
+  target="$MAINT_DIR/$key.json"
+  tmp="$(mktemp)"
+
+  python3 - "$scope" "$reason" "$created_epoch" "$expires_epoch" >"$tmp" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+scope, reason, created_epoch, expires_epoch = sys.argv[1:]
+created_epoch = int(created_epoch)
+expires_epoch = int(expires_epoch)
+
+def iso(ts: int) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+payload = {
+    "scope": scope,
+    "reason": reason,
+    "created_epoch": created_epoch,
+    "created_ts": iso(created_epoch),
+    "expires_epoch": expires_epoch,
+    "expires_ts": iso(expires_epoch),
+}
+print(json.dumps(payload, indent=2, sort_keys=True))
+PY
+
+  install -m 0600 "$tmp" "$target"
+  rm -f "$tmp"
+  log "active scope=$scope ttl=${ttl_seconds}s reason=${reason:-unspecified}"
+}
+
+remove_scope() {
+  local scope="$1"
+  local key
+  key="$(scope_key "$scope")"
+  rm -f "$MAINT_DIR/$key.json"
+  log "cleared scope=$scope"
+}
+
+scope_is_active() {
+  local wanted="$1"
+  cleanup_expired
+  python3 - "$MAINT_DIR" "$wanted" "$(date +%s)" <<'PY'
+import json
+import pathlib
+import sys
+
+maint_dir = pathlib.Path(sys.argv[1])
+wanted = sys.argv[2]
+now = int(sys.argv[3])
+
+for path in maint_dir.glob("*.json"):
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        continue
+    expires = int(payload.get("expires_epoch") or 0)
+    if expires <= now:
+        continue
+    scope = str(payload.get("scope") or "")
+    if scope == "all" or scope == wanted:
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+print_status() {
+  cleanup_expired
+  python3 - "$MAINT_DIR" "$(date +%s)" <<'PY'
+import json
+import pathlib
+import sys
+
+maint_dir = pathlib.Path(sys.argv[1])
+now = int(sys.argv[2])
+rows = []
+for path in maint_dir.glob("*.json"):
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        continue
+    expires = int(payload.get("expires_epoch") or 0)
+    if expires <= now:
+        continue
+    rows.append(
+        (
+            payload.get("scope") or "",
+            payload.get("reason") or "",
+            payload.get("created_ts") or "",
+            payload.get("expires_ts") or "",
+            max(0, expires - now),
+        )
+    )
+
+if not rows:
+    print("inactive")
+    raise SystemExit(0)
+
+for scope, reason, created_ts, expires_ts, seconds_left in sorted(rows):
+    print(f"scope={scope} reason={reason or 'unspecified'} created={created_ts} expires={expires_ts} seconds_left={seconds_left}")
+PY
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  vps-sentry-maintenance start --scope <scope> --ttl <ttl> [--reason <text>]
+  vps-sentry-maintenance stop --scope <scope>
+  vps-sentry-maintenance is-active --scope <scope>
+  vps-sentry-maintenance status
+
+Examples:
+  vps-sentry-maintenance start --scope vps-sentry-web.service --ttl 10m --reason deploy
+  vps-sentry-maintenance stop --scope vps-sentry-web.service
+  vps-sentry-maintenance is-active --scope vps-sentry-web.service
+EOF
+}
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || {
+  usage >&2
+  exit 1
+}
+shift || true
+
+case "$cmd" in
+  start)
+    scope=""
+    ttl=""
+    reason=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --scope)
+          [[ $# -ge 2 ]] || die "missing value for --scope"
+          scope="$2"
+          shift 2
+          ;;
+        --ttl)
+          [[ $# -ge 2 ]] || die "missing value for --ttl"
+          ttl="$2"
+          shift 2
+          ;;
+        --reason)
+          [[ $# -ge 2 ]] || die "missing value for --reason"
+          reason="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          die "unknown argument: $1"
+          ;;
+      esac
+    done
+    scope="$(trim "$scope")"
+    [[ -n "$scope" ]] || die "--scope is required"
+    ensure_dirs
+    cleanup_expired
+    write_token "$scope" "$(parse_ttl_seconds "$ttl")" "$(trim "$reason")"
+    ;;
+  stop)
+    scope=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --scope)
+          [[ $# -ge 2 ]] || die "missing value for --scope"
+          scope="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          die "unknown argument: $1"
+          ;;
+      esac
+    done
+    scope="$(trim "$scope")"
+    [[ -n "$scope" ]] || die "--scope is required"
+    ensure_dirs
+    remove_scope "$scope"
+    ;;
+  is-active)
+    scope=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --scope)
+          [[ $# -ge 2 ]] || die "missing value for --scope"
+          scope="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          die "unknown argument: $1"
+          ;;
+      esac
+    done
+    scope="$(trim "$scope")"
+    [[ -n "$scope" ]] || die "--scope is required"
+    ensure_dirs
+    scope_is_active "$scope"
+    ;;
+  status)
+    ensure_dirs
+    print_status
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $cmd"
+    ;;
+esac

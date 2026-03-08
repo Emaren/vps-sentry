@@ -3,16 +3,27 @@ set -euo pipefail
 
 SENTRY="/usr/local/bin/vps-sentry"
 SHIP="/usr/local/bin/vps-sentry-ship"
+NOTIFY="/usr/local/bin/vps-sentry-notify"
+SERVICE_EVENT="/usr/local/bin/vps-sentry-service-event"
+MAINTENANCE="/usr/local/bin/vps-sentry-maintenance"
+PROJECT_STORAGE="/usr/local/bin/vps-sentry-project-storage"
 
 STATE_DIR="/var/lib/vps-sentry"
 LAST_JSON="$STATE_DIR/last.json"
 MARKER="$STATE_DIR/last_shipped_ts.txt"
 
-DROPIN="/etc/systemd/system/vps-sentry.service.d/ship.conf"
+DROPIN="/etc/systemd/system/vps-sentry.service.d/90-post.conf"
 TMP_UNIT="/etc/systemd/system/zzz-vps-sentry-selftest.service"
 TMP_UNIT_OLD="/etc/systemd/system/zzz-tripwire.service"
 TEST_TRIP="$STATE_DIR/test/tripwire.txt"
 CONFIG_JSON="/etc/vps-sentry.json"
+PROJECTS_FILE="/etc/vps-sentry-projects.json"
+EVENT_UNIT="/etc/systemd/system/vps-sentry-unit-event@.service"
+WEB_EVENT_DROPIN="/etc/systemd/system/vps-sentry-web.service.d/10-vps-sentry-events.conf"
+PUBLIC_STATUS_DIR="$STATE_DIR/public"
+PUBLIC_STATUS_FILE="$PUBLIC_STATUS_DIR/status.json"
+PUBLIC_LAST_FILE="$PUBLIC_STATUS_DIR/last.json"
+PUBLIC_DIFF_FILE="$PUBLIC_STATUS_DIR/diff.json"
 
 WITH_NETWORK=0
 
@@ -169,6 +180,68 @@ cleanup() {
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
+service_user_for_unit() {
+  systemctl show -p User --value "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+user_can_access_paths() {
+  local service_user="$1"
+  shift || true
+  python3 - "$service_user" "$@" <<'PY'
+import grp
+import os
+import pwd
+import stat
+import sys
+
+user = sys.argv[1]
+paths = sys.argv[2:]
+
+try:
+    pw = pwd.getpwnam(user)
+except KeyError:
+    raise SystemExit(2)
+
+uid = pw.pw_uid
+groups = {pw.pw_gid}
+for entry in grp.getgrall():
+    if user in entry.gr_mem:
+        groups.add(entry.gr_gid)
+
+def has_access(path: str, want_exec: bool) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if uid == 0:
+        return True
+    if uid == st.st_uid:
+        mask = stat.S_IXUSR if want_exec else stat.S_IRUSR
+    elif st.st_gid in groups:
+        mask = stat.S_IXGRP if want_exec else stat.S_IRGRP
+    else:
+        mask = stat.S_IXOTH if want_exec else stat.S_IROTH
+    return bool(st.st_mode & mask)
+
+checks = [(paths[0], True), (paths[1], True), (paths[2], False), (paths[3], False), (paths[4], False)]
+for path, want_exec in checks:
+    if not has_access(path, want_exec):
+        raise SystemExit(1)
+PY
+}
+
+assert_public_status_readable() {
+  local service_user="$1"
+  [[ -n "$service_user" ]] || die "missing service user for public status readability check"
+  user_can_access_paths \
+    "$service_user" \
+    "$STATE_DIR" \
+    "$PUBLIC_STATUS_DIR" \
+    "$PUBLIC_STATUS_FILE" \
+    "$PUBLIC_LAST_FILE" \
+    "$PUBLIC_DIFF_FILE" || die "$service_user cannot traverse $STATE_DIR/public and read published status files"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-network)
@@ -199,6 +272,10 @@ echo
 echo "== 1) binaries =="
 test -x "$SENTRY" || die "missing or not executable: $SENTRY"
 test -x "$SHIP"  || die "missing or not executable: $SHIP"
+test -x "$NOTIFY" || die "missing or not executable: $NOTIFY"
+test -x "$SERVICE_EVENT" || die "missing or not executable: $SERVICE_EVENT"
+test -x "$MAINTENANCE" || die "missing or not executable: $MAINTENANCE"
+test -x "$PROJECT_STORAGE" || die "missing or not executable: $PROJECT_STORAGE"
 "$SENTRY" --version || true
 
 echo
@@ -207,6 +284,35 @@ systemctl is-enabled vps-sentry.timer >/dev/null || die "vps-sentry.timer is not
 systemctl cat vps-sentry.service --no-pager >/dev/null || die "cannot read vps-sentry.service"
 test -f "$DROPIN" || die "missing drop-in: $DROPIN"
 grep -Eq "ExecStartPost=.*vps-sentry-ship" "$DROPIN" || die "drop-in does not reference vps-sentry-ship: $DROPIN"
+grep -Eq "ExecStartPost=.*vps-sentry-project-storage" "$DROPIN" || die "drop-in does not reference vps-sentry-project-storage: $DROPIN"
+test -f "$EVENT_UNIT" || die "missing unit template: $EVENT_UNIT"
+grep -Eq 'Description=.*%i' "$EVENT_UNIT" || die "unit template description must use %i: $EVENT_UNIT"
+grep -Eq 'ExecStart=.*--spec %i' "$EVENT_UNIT" || die "unit template ExecStart must use %i: $EVENT_UNIT"
+test -f "$WEB_EVENT_DROPIN" || die "missing web event drop-in: $WEB_EVENT_DROPIN"
+python3 - "$PROJECTS_FILE" <<'PY' || die "missing disk storage roots for vps-sentry in $PROJECTS_FILE"
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text())
+projects = payload.get("projects")
+if not isinstance(projects, list):
+    raise SystemExit(1)
+
+for project in projects:
+    if not isinstance(project, dict):
+        continue
+    if project.get("id") != "vps-sentry":
+        continue
+    storage = project.get("storage")
+    roots = storage.get("roots") if isinstance(storage, dict) else None
+    if isinstance(roots, list) and any(str(root).strip() for root in roots):
+        raise SystemExit(0)
+    raise SystemExit(2)
+
+raise SystemExit(3)
+PY
 
 echo
 echo "== 3) ship script perms/owner =="
@@ -217,6 +323,15 @@ stat -c '%U %G %a %n' "$SHIP"
 echo
 echo "== 4) cleanup old selftest artifacts =="
 cleanup
+
+echo
+echo "== 4b) maintenance token smoke =="
+"$MAINTENANCE" start --scope vps-sentry-selftest.service --ttl 30s --reason selftest >/dev/null
+"$MAINTENANCE" is-active --scope vps-sentry-selftest.service || die "maintenance scope did not become active"
+"$MAINTENANCE" stop --scope vps-sentry-selftest.service >/dev/null
+if "$MAINTENANCE" is-active --scope vps-sentry-selftest.service; then
+  die "maintenance scope still active after stop"
+fi
 
 echo
 echo "== 5) baseline run + attempt to accept clean baseline =="
@@ -234,6 +349,28 @@ fi
 echo
 echo "Current alerts summary (post-baseline attempt):"
 json_alerts_summary
+
+echo
+echo "== 5b) published dashboard status invariants =="
+[[ "$(stat -c '%a' "$STATE_DIR")" == "711" ]] || die "$STATE_DIR mode drifted (expected 711)"
+if systemctl is-active --quiet vps-sentry-web.service; then
+  WEB_USER="$(service_user_for_unit vps-sentry-web.service)"
+  assert_public_status_readable "$WEB_USER"
+  READY_JSON="$(curl -fsS http://127.0.0.1:3035/api/readyz?check=status)" || die "readyz status probe failed"
+  python3 - <<'PY' "$READY_JSON"
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if not payload.get("ok"):
+    raise SystemExit("readyz returned ok=false")
+status = (payload.get("checks") or {}).get("status") or {}
+if not status.get("ok"):
+    raise SystemExit("readyz status check reported unreadable published status files")
+PY
+else
+  echo "Skipping dashboard readability check: vps-sentry-web.service inactive"
+fi
 
 # marker before
 BEFORE=""

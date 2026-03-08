@@ -18,7 +18,8 @@ if ! jq -s '
     + {
         ports_local:  ($s.ports_local  // $s.ports.local  // $l.ports_local  // $l.ports.local  // []),
         ports_public: ($s.ports_public // $s.ports.public // $l.ports_public // $l.ports.public // []),
-        vitals:       ($l.vitals // $s.vitals // {})
+        vitals:       ($l.vitals // $s.vitals // {}),
+        project_storage: ($s.project_storage // $l.project_storage // {})
       }
 ' "$status" "$last" >"$tmp"; then
   rm -f "$tmp"

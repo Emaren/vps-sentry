@@ -1,0 +1,183 @@
+{
+  "projects": [
+    {
+      "id": "vps-sentry",
+      "label": "VPS Sentry",
+      "public_url": "https://vps-sentry.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/VPSSentry",
+          "/var/www/vps-sentry"
+        ]
+      },
+      "services": [
+        {
+          "unit": "vps-sentry-web.service",
+          "label": "Public dashboard",
+          "domain": "vps-sentry.tokentap.ca",
+          "health_urls": [
+            "https://vps-sentry.tokentap.ca/api/readyz",
+            "http://127.0.0.1:3035/api/readyz"
+          ],
+          "impact": "The VPS Sentry dashboard and API go dark behind nginx until the web service is restored.",
+          "runbook": "systemctl status vps-sentry-web.service --no-pager -l && journalctl -u vps-sentry-web.service -n 80 --no-pager",
+          "open_title": "VPS Sentry dashboard inactive",
+          "recovery_title": "VPS Sentry dashboard restored",
+          "severity": "critical"
+        },
+        {
+          "unit": "vps-sentry-ops-worker.service",
+          "label": "Ops worker",
+          "domain": "vps-sentry.tokentap.ca",
+          "health_urls": [
+            "http://127.0.0.1:3035/api/ops/remediate-drain"
+          ],
+          "impact": "Queued remediation actions stop draining until the worker returns.",
+          "runbook": "systemctl status vps-sentry-ops-worker.service --no-pager -l && journalctl -u vps-sentry-ops-worker.service -n 80 --no-pager",
+          "open_title": "VPS Sentry ops worker inactive",
+          "recovery_title": "VPS Sentry ops worker restored",
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "id": "aoe2hdbets",
+      "label": "AoE2HDBets",
+      "public_url": "https://aoe2hdbets.com",
+      "storage": {
+        "roots": [
+          "/var/www/AoE2HDBets"
+        ]
+      }
+    },
+    {
+      "id": "4o",
+      "label": "4o API",
+      "public_url": "https://api.4o.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/4o"
+        ]
+      }
+    },
+    {
+      "id": "wheatandstone",
+      "label": "Wheat & Stone",
+      "public_url": "https://wheatandstone.ca",
+      "storage": {
+        "roots": [
+          "/var/www/WheatAndStone"
+        ]
+      }
+    },
+    {
+      "id": "tokentap",
+      "label": "TokenTap",
+      "public_url": "https://tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/TokenTap"
+        ]
+      }
+    },
+    {
+      "id": "tokenchain",
+      "label": "TokenChain",
+      "storage": {
+        "roots": [
+          "/var/www/tokenchain-web",
+          "/var/www/tokenchain-chain"
+        ]
+      }
+    },
+    {
+      "id": "tokenchain-bigdipper",
+      "label": "TokenChain BigDipper",
+      "storage": {
+        "roots": [
+          "/var/www/tokenchain-bigdipper"
+        ]
+      }
+    },
+    {
+      "id": "tokenchain-indexer",
+      "label": "TokenChain Indexer",
+      "storage": {
+        "roots": [
+          "/var/www/tokenchain-indexer"
+        ]
+      }
+    },
+    {
+      "id": "llama",
+      "label": "Llama",
+      "public_url": "https://llama.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/Llama"
+        ]
+      }
+    },
+    {
+      "id": "pulse",
+      "label": "Pulse",
+      "public_url": "https://pulse.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/Pulse"
+        ]
+      }
+    },
+    {
+      "id": "redlinelegal",
+      "label": "Redline Legal",
+      "public_url": "https://redlinelegal.ca",
+      "storage": {
+        "roots": [
+          "/var/www/RedlineLegal"
+        ]
+      }
+    },
+    {
+      "id": "tmail",
+      "label": "TMail",
+      "public_url": "https://tmail.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/TMail"
+        ]
+      }
+    },
+    {
+      "id": "vps-host",
+      "label": "VPS Host",
+      "services": [
+        {
+          "unit": "nginx.service",
+          "label": "Public edge proxy",
+          "domain": "public HTTPS domains hosted on this VPS",
+          "health_urls": [
+            "https://vps-sentry.tokentap.ca/api/readyz"
+          ],
+          "impact": "Public HTTP and HTTPS traffic for hosted apps on this VPS fails until nginx is restored.",
+          "runbook": "nginx -t && systemctl status nginx.service --no-pager -l && journalctl -u nginx.service -n 80 --no-pager",
+          "open_title": "nginx edge proxy inactive",
+          "recovery_title": "nginx edge proxy restored",
+          "severity": "critical"
+        },
+        {
+          "unit": "ssh.service",
+          "aliases": [
+            "sshd.service"
+          ],
+          "label": "Primary SSH access",
+          "impact": "Remote shell access may fail unless another access path is already available.",
+          "runbook": "systemctl status ssh.service --no-pager -l && journalctl -u ssh.service -n 80 --no-pager",
+          "open_title": "SSH access inactive",
+          "recovery_title": "SSH access restored",
+          "severity": "critical"
+        }
+      ]
+    }
+  ]
+}

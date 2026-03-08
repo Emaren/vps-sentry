@@ -11,6 +11,7 @@ INVALID_WEBHOOK_MARKER="$STATE_DIR/ship_invalid_webhook.txt"
 CONFIG_JSON="/etc/vps-sentry.json"
 EVIDENCE_KEY_DIR="${VPS_SENTRY_KEY_DIR:-/var/lib/vps-sentry/keys}"
 INVALID_WEBHOOK_COOLDOWN_SEC="${VPS_SENTRY_SHIP_INVALID_WEBHOOK_COOLDOWN_SEC:-3600}"
+NOTIFY_BIN="${VPS_SENTRY_NOTIFY_BIN:-/usr/local/bin/vps-sentry-notify}"
 
 log() {
   printf 'vps-sentry-ship: %s\n' "$*" >&2
@@ -71,7 +72,9 @@ should_pause_invalid_webhook() {
   return 1
 }
 
-mkdir -p "$STATE_DIR"
+# Keep the state root private while allowing the web app user to traverse into
+# the published public files under /var/lib/vps-sentry/public.
+install -d -m 0711 -o root -g root "$STATE_DIR"
 
 # Prevent overlapping ships (timer + manual runs, or back-to-back systemd starts)
 LOCKFILE="$STATE_DIR/ship.lock"
@@ -195,6 +198,12 @@ fi
 if [[ -f "$MARKER" ]] && [[ "$(cat "$MARKER")" == "$TS" ]]; then
   log "skip: already shipped ts=$TS"
   exit 0
+fi
+
+if [[ -x "$NOTIFY_BIN" ]]; then
+  if ! "$NOTIFY_BIN" ship-last --last-json "$LAST_JSON"; then
+    log "warn: host notify path failed for ts=$TS"
+  fi
 fi
 
 if [[ ! -f "$CONFIG_JSON" ]]; then

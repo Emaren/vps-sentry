@@ -11,29 +11,222 @@ log()  { echo "[APP-SANITY] $*"; logger -t vps-sentry-app-sanity -- "$*"; }
 warn() { log "WARN: $*"; exit 0; }
 fail() { log "FAIL: $*"; exit 2; }
 
+STATE_DIR="${VPS_SENTRY_STATE_DIR:-/var/lib/vps-sentry}"
+LAST_JSON="$STATE_DIR/last.json"
+INACTIVE_MARKER="$STATE_DIR/.app-sanity-vps-sentry-web-inactive"
+FAIL_MARKER="$STATE_DIR/.app-sanity-vps-sentry-web-failed"
+STATUS_MARKER="$STATE_DIR/.app-sanity-vps-sentry-web-status-unreadable"
+READY_MARKER="$STATE_DIR/.app-sanity-vps-sentry-web-readyz-failed"
+PUBLISH_BIN="${VPS_SENTRY_PUBLISH_BIN:-/usr/local/bin/vps-sentry-publish}"
+PORTS_NORMALIZE_BIN="${VPS_SENTRY_PORTS_NORMALIZE_BIN:-/usr/local/bin/vps-sentry-ports-normalize}"
+WEB_SERVICE="${VPS_SENTRY_WEB_SERVICE:-vps-sentry-web.service}"
+READY_URL="${VPS_SENTRY_READY_URL:-http://127.0.0.1:3035/api/readyz?check=status}"
+PUBLIC_STATUS_DIR="$STATE_DIR/public"
+PUBLIC_STATUS_FILE="$PUBLIC_STATUS_DIR/status.json"
+PUBLIC_LAST_FILE="$PUBLIC_STATUS_DIR/last.json"
+PUBLIC_DIFF_FILE="$PUBLIC_STATUS_DIR/diff.json"
+
+clear_marker() {
+  local marker="$1"
+  rm -f "$marker" 2>/dev/null || true
+}
+
+republish_status() {
+  "$PUBLISH_BIN" >/dev/null 2>&1 || true
+  "$PORTS_NORMALIZE_BIN" >/dev/null 2>&1 || true
+}
+
+append_alert_to_last_json() {
+  local title="$1"
+  local detail="$2"
+  local severity="${3:-critical}"
+  local code="${4:-app_sanity_failed}"
+
+  if [[ ! -s "$LAST_JSON" ]]; then
+    log "WARN: missing/empty $LAST_JSON; cannot append alert code=$code"
+    return 1
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  python3 - "$LAST_JSON" "$title" "$detail" "$severity" "$code" >"$tmp" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+last_path, title, detail, severity, code = sys.argv[1:]
+payload = json.loads(Path(last_path).read_text())
+alerts = payload.get("alerts")
+if not isinstance(alerts, list):
+    alerts = []
+alerts.append(
+    {
+        "title": (title or "Alert").strip()[:160],
+        "detail": (detail or "").strip()[:1800],
+        "severity": severity if severity in {"info", "warn", "critical"} else "critical",
+        "code": (code or "app_sanity_failed").strip()[:80],
+    }
+)
+payload["alerts"] = alerts
+print(json.dumps(payload, indent=2))
+PY
+
+  install -m 0644 "$tmp" "$LAST_JSON"
+  rm -f "$tmp"
+  republish_status
+  log "ALERT: appended $code to $LAST_JSON"
+}
+
+alert_once() {
+  local marker="$1"
+  local title="$2"
+  local detail="$3"
+  local severity="${4:-critical}"
+  local code="${5:-app_sanity_failed}"
+
+  if [[ -f "$marker" ]]; then
+    fail "$detail"
+  fi
+
+  append_alert_to_last_json "$title" "$detail" "$severity" "$code" || true
+  : >"$marker"
+  chmod 0600 "$marker" 2>/dev/null || true
+  fail "$detail"
+}
+
 redact_url_secret() {
   local raw="$1"
   printf '%s' "$raw" | sed -E 's#(://[^:/@]+):[^@]*@#\1:***@#g'
+}
+
+service_user_for_unit() {
+  systemctl show -p User --value "$WEB_SERVICE" 2>/dev/null | tr -d '[:space:]'
+}
+
+user_can_access_paths() {
+  local service_user="$1"
+  shift || true
+  python3 - "$service_user" "$@" <<'PY'
+import grp
+import os
+import pwd
+import stat
+import sys
+
+user = sys.argv[1]
+paths = sys.argv[2:]
+
+try:
+    pw = pwd.getpwnam(user)
+except KeyError:
+    raise SystemExit(2)
+
+uid = pw.pw_uid
+groups = {pw.pw_gid}
+for entry in grp.getgrall():
+    if user in entry.gr_mem:
+        groups.add(entry.gr_gid)
+
+def has_access(path: str, want_exec: bool) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if uid == 0:
+        return True
+    if uid == st.st_uid:
+        mask = stat.S_IXUSR if want_exec else stat.S_IRUSR
+    elif st.st_gid in groups:
+        mask = stat.S_IXGRP if want_exec else stat.S_IRGRP
+    else:
+        mask = stat.S_IXOTH if want_exec else stat.S_IROTH
+    return bool(st.st_mode & mask)
+
+checks = [(paths[0], True), (paths[1], True), (paths[2], False), (paths[3], False), (paths[4], False)]
+for path, want_exec in checks:
+    if not has_access(path, want_exec):
+        raise SystemExit(1)
+PY
+}
+
+service_user_can_read_public_status() {
+  local service_user="$1"
+  [[ -n "$service_user" ]] || return 1
+  user_can_access_paths \
+    "$service_user" \
+    "$STATE_DIR" \
+    "$PUBLIC_STATUS_DIR" \
+    "$PUBLIC_STATUS_FILE" \
+    "$PUBLIC_LAST_FILE" \
+    "$PUBLIC_DIFF_FILE"
 }
 
 APP_HOST="${VPS_SENTRY_APP_HOST:-https://vps-sentry.tokentap.ca}"
 WEB_DIR="${VPS_SENTRY_WEB_DIR:-/var/www/VPSSentry/vps-sentry-web}"
 ENV_LOCAL="$WEB_DIR/.env.local"
 ENV_FILE="$WEB_DIR/.env"
+BUILD_ID_FILE="$WEB_DIR/.next/BUILD_ID"
+PACKAGE_JSON="$WEB_DIR/package.json"
+
+app_expected=0
+if [[ -f "$ENV_LOCAL" || -f "$ENV_FILE" || -f "$BUILD_ID_FILE" || -f "$PACKAGE_JSON" ]]; then
+  app_expected=1
+fi
 
 # If the web UI service isn't running, don't tank VPS-Sentry runs.
-# This is an auxiliary check.
-if ! systemctl is-active --quiet vps-sentry-web.service; then
-  warn "vps-sentry-web.service not active (skipping app sanity)"
+# This is an auxiliary check, but if the app is deployed and the service is
+# down we still want a real host-side alert so shipping/notifications can fire.
+if ! systemctl is-active --quiet "$WEB_SERVICE"; then
+  if [[ "$app_expected" -eq 0 ]]; then
+    clear_marker "$INACTIVE_MARKER"
+    clear_marker "$FAIL_MARKER"
+    clear_marker "$STATUS_MARKER"
+    clear_marker "$READY_MARKER"
+    warn "missing deploy markers under $WEB_DIR (skipping app sanity; app not configured/deployed here)"
+  fi
+  alert_once \
+    "$INACTIVE_MARKER" \
+    "VPS Sentry web service inactive" \
+    "$WEB_SERVICE is not active; nginx upstreams to the web app will fail until it is restarted" \
+    "critical" \
+    "app_service_inactive"
 fi
+clear_marker "$INACTIVE_MARKER"
 
 # If env isn't present, treat as "not configured yet" and skip quietly.
 if [[ ! -f "$ENV_LOCAL" && ! -f "$ENV_FILE" ]]; then
+  clear_marker "$FAIL_MARKER"
+  clear_marker "$STATUS_MARKER"
+  clear_marker "$READY_MARKER"
   warn "missing $ENV_LOCAL and $ENV_FILE (skipping app sanity; app not configured/deployed here)"
 fi
 
-# healthz should work if service is active; if it doesn't, that's a real signal.
-curl -fsS "$APP_HOST/healthz" >/dev/null || fail "healthz failed: $APP_HOST/healthz"
+# The dashboard depends on the published public status files remaining readable
+# by the web service user.
+service_user="$(service_user_for_unit)"
+[[ -n "$service_user" ]] || alert_once \
+  "$STATUS_MARKER" \
+  "VPS Sentry dashboard status path unreadable" \
+  "could not determine the service user for $WEB_SERVICE" \
+  "critical" \
+  "app_public_status_unreadable"
+
+service_user_can_read_public_status "$service_user" || alert_once \
+  "$STATUS_MARKER" \
+  "VPS Sentry dashboard status path unreadable" \
+  "$service_user cannot traverse $STATE_DIR/public and read status.json/last.json/diff.json" \
+  "critical" \
+  "app_public_status_unreadable"
+clear_marker "$STATUS_MARKER"
+
+# readyz should reflect whether the dashboard can read live status data.
+curl -fsS "$READY_URL" >/dev/null || alert_once \
+  "$READY_MARKER" \
+  "VPS Sentry web readiness failed" \
+  "readyz failed: $READY_URL" \
+  "critical" \
+  "app_readyz_failed"
+clear_marker "$READY_MARKER"
 
 # Validate whichever env files exist.
 files_to_check=()
@@ -47,7 +240,12 @@ fi
 for f in "${files_to_check[@]}"; do
   perms="$(stat -c '%a' "$f")"
   if [[ "$perms" != "600" && "$perms" != "400" ]]; then
-    fail "bad perms on $f (got $perms; want 600/400)"
+    alert_once \
+      "$FAIL_MARKER" \
+      "VPS Sentry web sanity failed" \
+      "bad perms on $f (got $perms; want 600/400)" \
+      "critical" \
+      "app_sanity_failed"
   fi
 done
 
@@ -59,11 +257,17 @@ elif [[ -f "$ENV_FILE" ]] && rg -q '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null; the
   dburl="$(rg -n '^DATABASE_URL=' "$ENV_FILE" | head -n 1 | sed -E 's/.*DATABASE_URL="?([^"]+)"?/\1/')"
 fi
 
-[[ -n "${dburl:-}" ]] || fail "DATABASE_URL not found in $ENV_LOCAL (or $ENV_FILE)"
+[[ -n "${dburl:-}" ]] || alert_once \
+  "$FAIL_MARKER" \
+  "VPS Sentry web sanity failed" \
+  "DATABASE_URL not found in $ENV_LOCAL (or $ENV_FILE)" \
+  "critical" \
+  "app_sanity_failed"
 
 # Only support sqlite file: URLs here (otherwise this check isn't applicable)
 if [[ "$dburl" != file:* ]]; then
   safe_dburl="$(redact_url_secret "$dburl")"
+  clear_marker "$FAIL_MARKER"
   warn "DATABASE_URL is not sqlite file:... (got: $safe_dburl) (skipping sqlite checks)"
 fi
 
@@ -78,26 +282,67 @@ if [[ "$dbpath" != /* ]]; then
   dbpath="$WEB_DIR/$dbpath"
 fi
 
-[[ -f "$dbpath" ]] || fail "DATABASE_URL points to missing db: $dbpath"
+[[ -f "$dbpath" ]] || alert_once \
+  "$FAIL_MARKER" \
+  "VPS Sentry web sanity failed" \
+  "DATABASE_URL points to missing db: $dbpath" \
+  "critical" \
+  "app_sanity_failed"
 size="$(stat -c '%s' "$dbpath")"
-[[ "$size" -gt 0 ]] || fail "sqlite db is empty (0 bytes): $dbpath"
+[[ "$size" -gt 0 ]] || alert_once \
+  "$FAIL_MARKER" \
+  "VPS Sentry web sanity failed" \
+  "sqlite db is empty (0 bytes): $dbpath" \
+  "critical" \
+  "app_sanity_failed"
 
 # Schema sanity (NextAuth tables)
-sqlite3 "$dbpath" ".tables" | rg -q '\bUser\b'              || fail "sqlite missing table: User"
-sqlite3 "$dbpath" ".tables" | rg -q '\bSession\b'           || fail "sqlite missing table: Session"
-sqlite3 "$dbpath" ".tables" | rg -q '\bAccount\b'           || fail "sqlite missing table: Account"
-sqlite3 "$dbpath" ".tables" | rg -q '\bVerificationToken\b' || fail "sqlite missing table: VerificationToken"
+sqlite3 "$dbpath" ".tables" | rg -q '\bUser\b'              || alert_once \
+  "$FAIL_MARKER" \
+  "VPS Sentry web sanity failed" \
+  "sqlite missing table: User" \
+  "critical" \
+  "app_sanity_failed"
+sqlite3 "$dbpath" ".tables" | rg -q '\bSession\b'           || alert_once \
+  "$FAIL_MARKER" \
+  "VPS Sentry web sanity failed" \
+  "sqlite missing table: Session" \
+  "critical" \
+  "app_sanity_failed"
+sqlite3 "$dbpath" ".tables" | rg -q '\bAccount\b'           || alert_once \
+  "$FAIL_MARKER" \
+  "VPS Sentry web sanity failed" \
+  "sqlite missing table: Account" \
+  "critical" \
+  "app_sanity_failed"
+sqlite3 "$dbpath" ".tables" | rg -q '\bVerificationToken\b' || alert_once \
+  "$FAIL_MARKER" \
+  "VPS Sentry web sanity failed" \
+  "sqlite missing table: VerificationToken" \
+  "critical" \
+  "app_sanity_failed"
 
 # Footgun: repo-root dev.db should not exist (or if it does, it should be the real DB you intended)
 if [[ -f "$WEB_DIR/dev.db" ]]; then
   s2="$(stat -c '%s' "$WEB_DIR/dev.db")"
   if [[ "$s2" -eq 0 ]]; then
-    fail "repo-root dev.db exists AND is empty (classic DATABASE_URL footgun): $WEB_DIR/dev.db"
+    alert_once \
+      "$FAIL_MARKER" \
+      "VPS Sentry web sanity failed" \
+      "repo-root dev.db exists AND is empty (classic DATABASE_URL footgun): $WEB_DIR/dev.db" \
+      "critical" \
+      "app_sanity_failed"
   else
     # still suspicious — keep it as FAIL so you notice early
-    fail "repo-root dev.db exists (unexpected): $WEB_DIR/dev.db (size=$s2)"
+    alert_once \
+      "$FAIL_MARKER" \
+      "VPS Sentry web sanity failed" \
+      "repo-root dev.db exists (unexpected): $WEB_DIR/dev.db (size=$s2)" \
+      "critical" \
+      "app_sanity_failed"
   fi
 fi
 
+clear_marker "$FAIL_MARKER"
 log "OK: service+health+db+env look sane"
 exit 0
