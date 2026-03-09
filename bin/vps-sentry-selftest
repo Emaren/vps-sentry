@@ -278,6 +278,8 @@ test -x "$NOTIFY" || die "missing or not executable: $NOTIFY"
 test -x "$SERVICE_EVENT" || die "missing or not executable: $SERVICE_EVENT"
 test -x "$MAINTENANCE" || die "missing or not executable: $MAINTENANCE"
 test -x "$PROJECT_STORAGE" || die "missing or not executable: $PROJECT_STORAGE"
+test -x "$GARBAGE_ESTIMATE" || die "missing or not executable: $GARBAGE_ESTIMATE"
+test -x "$GARBAGE_RECLAIM" || die "missing or not executable: $GARBAGE_RECLAIM"
 "$SENTRY" --version || true
 
 echo
