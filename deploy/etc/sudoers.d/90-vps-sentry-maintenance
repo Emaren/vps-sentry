@@ -1,1 +1,1 @@
-tony ALL=(root) NOPASSWD: /usr/local/bin/vps-sentry-maintenance, /usr/local/bin/vps-sentry-garbage-reclaim
+tony ALL=(root) NOPASSWD: /usr/local/bin/vps-sentry-maintenance, /usr/local/bin/vps-sentry-garbage-reclaim, /usr/local/bin/vps-sentry-counterstrike

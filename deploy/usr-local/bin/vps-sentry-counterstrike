@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+import argparse
+import errno
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("VPS_SENTRY_STATE_DIR", "/var/lib/vps-sentry"))
+PUBLIC_STATUS_JSON = STATE_DIR / "public" / "status.json"
+LAST_STATUS_JSON = STATE_DIR / "last.json"
+RUNNING_JSON = STATE_DIR / "counterstrike-running.json"
+LAST_JSON = STATE_DIR / "counterstrike-last.json"
+RUNS_DIR = STATE_DIR / "counterstrike-runs"
+LOCK_FILE = STATE_DIR / ".counterstrike.lock"
+SCHEMA_VERSION = 1
+RECENT_LINES_LIMIT = max(4, int(os.environ.get("VPS_SENTRY_COUNTERSTRIKE_RECENT_LINES", "8")))
+MAX_HISTORY_RUNS = max(6, int(os.environ.get("VPS_SENTRY_COUNTERSTRIKE_MAX_HISTORY_RUNS", "24")))
+MAX_CANDIDATES = max(1, int(os.environ.get("VPS_SENTRY_COUNTERSTRIKE_MAX_CANDIDATES", "4")))
+COMMAND_TIMEOUT_SECONDS = max(
+    5, int(os.environ.get("VPS_SENTRY_COUNTERSTRIKE_COMMAND_TIMEOUT_SECONDS", "45"))
+)
+USER_WRITABLE_PREFIXES = (
+    "/home/",
+    "/tmp/",
+    "/var/tmp/",
+    "/dev/shm/",
+    "/run/user/",
+    "/root/",
+)
+SUSPICIOUS_NAME_TOKENS = (
+    "systemd-logind",
+    "kdevtmpfsi",
+    "xmrig",
+    "kworker",
+    "sysupdate",
+    "sysguard",
+    "networkd-dispatcher",
+)
+SYSTEM_CRON_FILES = (Path("/etc/crontab"),)
+SYSTEM_CRON_DIRS = (Path("/etc/cron.d"),)
+PHASE_TOTALS = {
+    "analyze": 3,
+    "dry-run": 3,
+    "execute": 6,
+}
+PHASE_ETAS = {
+    "snapshot": 6,
+    "classify": 5,
+    "neutralize": 12,
+    "harden": 8,
+    "verify": 20,
+    "record": 4,
+}
+
+PLAYBOOK = {
+    "id": "zap-01-miner-persistence-purge",
+    "label": "Zap! #1",
+    "title": "Miner Persistence Purge",
+    "description": "Kill suspicious miner-style processes in writable paths, quarantine binaries, and scrub matching cron persistence.",
+}
+
+
+def iso_utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def error_message(err: Exception | BaseException) -> str:
+    return err if isinstance(err, str) else str(err)
+
+
+def load_json(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def write_json(path: Path, payload: dict[str, object], mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent)) as tmp:
+        json.dump(payload, tmp, indent=2, sort_keys=True)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
+
+
+def as_dict(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def as_list(value: object) -> list[object]:
+    return value if isinstance(value, list) else []
+
+
+def as_str(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def as_int(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except Exception:
+            return 0
+    return 0
+
+
+def sanitize_slug(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()
+    return cleaned or "item"
+
+
+def now_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def elapsed_seconds(started_at: str) -> int:
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except Exception:
+        return 0
+    return max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+
+
+def tail_lines(path: Path, limit: int = RECENT_LINES_LIMIT) -> list[str]:
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+    return lines[-limit:]
+
+
+def is_user_writable_path(path_text: str) -> bool:
+    normalized = os.path.normpath(path_text.strip())
+    if not normalized.startswith("/"):
+        return False
+    return any(normalized.startswith(prefix) for prefix in USER_WRITABLE_PREFIXES)
+
+
+def extract_status_source() -> dict[str, object]:
+    public = load_json(PUBLIC_STATUS_JSON) or {}
+    last = load_json(LAST_STATUS_JSON) or {}
+    merged = {**last, **public}
+
+    public_threat = as_dict(public.get("threat"))
+    last_threat = as_dict(last.get("threat"))
+    if public_threat or last_threat:
+        merged["threat"] = {**(last_threat or {}), **(public_threat or {})}
+
+    public_alerts = as_list(public.get("alerts"))
+    last_alerts = as_list(last.get("alerts"))
+    merged["alerts"] = public_alerts if public_alerts else last_alerts
+    merged["alerts_count"] = as_int(merged.get("alerts_count") or len(as_list(merged.get("alerts"))))
+    return merged
+
+
+@dataclass
+class Candidate:
+    pid: int
+    user: str
+    proc: str
+    exe: str
+    cmdline: str
+    reasons: list[str]
+    score: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "pid": self.pid,
+            "user": self.user,
+            "proc": self.proc,
+            "exe": self.exe,
+            "cmdline": self.cmdline,
+            "reasons": self.reasons,
+            "score": self.score,
+        }
+
+
+def candidate_score(proc: str, exe: str, cmdline: str, reasons: list[str]) -> int:
+    score = len(reasons)
+    lower = " ".join([proc, exe, cmdline]).lower()
+    if is_user_writable_path(exe):
+        score += 4
+    if "ppid=1" in lower:
+        score += 1
+    if any(token in lower for token in SUSPICIOUS_NAME_TOKENS):
+        score += 3
+    if any("writable path" in reason.lower() for reason in reasons):
+        score += 2
+    if any("outbound" in reason.lower() or "fanout" in reason.lower() for reason in reasons):
+        score += 2
+    return score
+
+
+def extract_candidates(status: dict[str, object]) -> list[Candidate]:
+    threat = as_dict(status.get("threat")) or {}
+    rows = as_list(threat.get("suspicious_processes"))
+    out: list[Candidate] = []
+    seen: set[int] = set()
+
+    for raw in rows:
+        row = as_dict(raw)
+        if not row:
+            continue
+        pid = as_int(row.get("pid"))
+        if pid <= 1 or pid in seen:
+            continue
+        exe = os.path.normpath(as_str(row.get("exe")))
+        if not exe or not exe.startswith("/"):
+            continue
+        proc = as_str(row.get("proc")) or Path(exe).name
+        cmdline = as_str(row.get("cmdline"))
+        reasons = [as_str(item) for item in as_list(row.get("reasons")) if as_str(item)]
+        score = candidate_score(proc, exe, cmdline, reasons)
+        if not is_user_writable_path(exe) and score < 6:
+            continue
+        seen.add(pid)
+        out.append(
+            Candidate(
+                pid=pid,
+                user=as_str(row.get("user")) or "root",
+                proc=proc or "process",
+                exe=exe,
+                cmdline=cmdline,
+                reasons=reasons,
+                score=score,
+            )
+        )
+
+    out.sort(key=lambda item: (item.score, item.pid), reverse=True)
+    return out[:MAX_CANDIDATES]
+
+
+def build_armed_state(status: dict[str, object], candidates: list[Candidate]) -> dict[str, object]:
+    alerts = as_list(status.get("alerts"))
+    armed = bool(candidates)
+    reason = "No miner-persistence candidates matched the current threat snapshot."
+    if candidates:
+        reason = f"{len(candidates)} suspicious runtime candidate(s) matched the Counterstrike playbook."
+    elif any(as_str(as_dict(alert).get("code")) == "suspicious_process_ioc" for alert in alerts if as_dict(alert)):
+        reason = "Threat feed still reports suspicious runtime IOC activity, but no safe Counterstrike candidates matched."
+    return {
+        "active": armed,
+        "label": "armed" if armed else "standby",
+        "reason": reason,
+        "candidate_count": len(candidates),
+    }
+
+
+class Progress:
+    def __init__(self, *, run_id: str, mode: str, playbook: dict[str, str], run_dir: Path):
+        self.run_id = run_id
+        self.mode = mode
+        self.playbook = playbook
+        self.run_dir = run_dir
+        self.console_path = run_dir / "console.log"
+        self.evidence_dir = run_dir / "evidence"
+        self.recent_lines: deque[str] = deque(maxlen=RECENT_LINES_LIMIT)
+        self.started_at = iso_utc_now()
+        self.updated_at = self.started_at
+        self.phase = "snapshot"
+        self.current_label = "Collecting evidence"
+        self.current_command = ""
+        self.completed_steps = 0
+        self.total_steps = PHASE_TOTALS.get(mode, 3)
+        self.eta_seconds = PHASE_ETAS.get("snapshot", 6)
+        self.armed: dict[str, object] | None = None
+        self.rollback_available = False
+        self.evidence_captured = False
+        self.console_path.parent.mkdir(parents=True, exist_ok=True)
+        self.evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    def append(self, line: str) -> None:
+        clean = line.strip()
+        if not clean:
+            return
+        stamped = f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}Z] {clean}"
+        self.recent_lines.append(stamped)
+        self.console_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.console_path.open("a", encoding="utf-8") as handle:
+            handle.write(stamped)
+            handle.write("\n")
+        self.updated_at = iso_utc_now()
+        self.persist()
+
+    def set_phase(self, phase: str, label: str, step: int) -> None:
+        self.phase = phase
+        self.current_label = label
+        self.completed_steps = max(0, step)
+        self.eta_seconds = PHASE_ETAS.get(phase)
+        self.updated_at = iso_utc_now()
+        self.persist()
+
+    def set_command(self, command: str) -> None:
+        self.current_command = command
+        self.updated_at = iso_utc_now()
+        self.persist()
+
+    def persist(self) -> None:
+        payload = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "pid": os.getpid(),
+            "playbook": self.playbook["id"],
+            "playbook_label": self.playbook["label"],
+            "playbook_title": self.playbook["title"],
+            "mode": self.mode,
+            "started_at": self.started_at,
+            "updated_at": self.updated_at,
+            "phase": self.phase,
+            "current_label": self.current_label,
+            "current_command": self.current_command or None,
+            "completed_steps": self.completed_steps,
+            "total_steps": self.total_steps,
+            "eta_seconds": self.eta_seconds,
+            "recent_lines": list(self.recent_lines),
+            "console_path": str(self.console_path),
+            "evidence_dir": str(self.evidence_dir),
+            "rollback_available": self.rollback_available,
+            "evidence_captured": self.evidence_captured,
+            "armed": self.armed,
+        }
+        write_json(RUNNING_JSON, payload, mode=0o644)
+
+
+def command_text(args: list[str]) -> str:
+    return " ".join(args)
+
+
+def run_command(
+    args: list[str],
+    progress: Progress | None = None,
+    *,
+    timeout: int = COMMAND_TIMEOUT_SECONDS,
+    input_text: str | None = None,
+    allow_fail: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    if progress:
+        progress.set_command(command_text(args))
+        progress.append(f"$ {command_text(args)}")
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=input_text,
+        )
+    except (OSError, subprocess.TimeoutExpired) as err:
+        if progress:
+            progress.append(str(err))
+        if allow_fail:
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr=str(err))
+        raise RuntimeError(f"{command_text(args)} failed: {err}") from err
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if progress:
+        if stdout:
+            for line in stdout.splitlines()[-3:]:
+                progress.append(line)
+        if stderr:
+            for line in stderr.splitlines()[-3:]:
+                progress.append(line)
+    if completed.returncode != 0 and not allow_fail:
+        raise RuntimeError(
+            f"{command_text(args)} exited {completed.returncode}: {(stderr or stdout or 'command failed').strip()}"
+        )
+    return completed
+
+
+def process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as err:
+        if err.errno == errno.ESRCH:
+            return False
+        return True
+
+
+def stop_process(pid: int, progress: Progress) -> tuple[bool, str]:
+    if not process_is_alive(pid):
+        return True, "process already gone"
+    run_command(["kill", "-TERM", str(pid)], progress, allow_fail=True)
+    time.sleep(1.0)
+    if process_is_alive(pid):
+        run_command(["kill", "-KILL", str(pid)], progress, allow_fail=True)
+        time.sleep(0.6)
+    if process_is_alive(pid):
+        return False, "process still alive after TERM/KILL"
+    return True, "process stopped"
+
+
+def unique_path(dir_path: Path, base_name: str) -> Path:
+    stem = sanitize_slug(base_name)
+    candidate = dir_path / stem
+    if not candidate.exists():
+        return candidate
+    index = 2
+    while True:
+        next_candidate = dir_path / f"{stem}-{index}"
+        if not next_candidate.exists():
+            return next_candidate
+        index += 1
+
+
+def capture_process_evidence(candidate: Candidate, evidence_dir: Path, progress: Progress) -> None:
+    proc_dir = evidence_dir / "processes"
+    proc_dir.mkdir(parents=True, exist_ok=True)
+    write_json(proc_dir / f"candidate-{candidate.pid}.json", candidate.to_dict())
+
+    ps_out = run_command(
+        ["ps", "-fp", str(candidate.pid)],
+        progress,
+        allow_fail=True,
+        timeout=10,
+    )
+    (proc_dir / f"ps-{candidate.pid}.txt").write_text(ps_out.stdout or ps_out.stderr or "", encoding="utf-8")
+
+    proc_root = Path("/proc") / str(candidate.pid)
+    for proc_file in ("status", "cmdline", "environ"):
+        source = proc_root / proc_file
+        target = proc_dir / f"{proc_file}-{candidate.pid}.txt"
+        try:
+            if proc_file == "cmdline":
+                raw = source.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+                target.write_text(raw, encoding="utf-8")
+            elif proc_file == "environ":
+                raw = source.read_bytes().replace(b"\x00", b"\n").decode("utf-8", errors="replace")
+                target.write_text(raw, encoding="utf-8")
+            else:
+                shutil.copy2(source, target)
+        except Exception:
+            continue
+
+
+def quarantine_executable(candidate: Candidate, evidence_dir: Path, progress: Progress) -> tuple[bool, str | None, str]:
+    source = Path(candidate.exe)
+    if not source.exists():
+        return True, None, "executable already missing"
+
+    quarantine_dir = evidence_dir / "quarantine"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    target = unique_path(quarantine_dir, source.name)
+
+    try:
+        shutil.copy2(source, target)
+        progress.append(f"Evidence copy saved: {target}")
+    except Exception as err:
+        progress.append(f"Failed to copy executable for evidence: {err}")
+
+    try:
+        os.replace(source, target)
+        return True, str(target), "executable quarantined"
+    except Exception:
+        try:
+            shutil.copy2(source, target)
+            source.unlink()
+            return True, str(target), "executable copied to quarantine and removed"
+        except Exception as err:
+            return False, str(target), f"failed to quarantine executable: {err}"
+
+
+def cron_matchers_for_candidate(candidate: Candidate) -> set[str]:
+    markers = {candidate.exe.lower()}
+    argv0 = candidate.cmdline.split()[0].strip() if candidate.cmdline.strip() else ""
+    if argv0.startswith("/"):
+        markers.add(os.path.normpath(argv0).lower())
+    return {marker for marker in markers if marker}
+
+
+def should_remove_cron_line(line: str, markers: set[str]) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    lowered = stripped.lower()
+    return any(marker in lowered for marker in markers)
+
+
+def scrub_user_crontab(user: str, markers: set[str], evidence_dir: Path, progress: Progress) -> tuple[int, list[str]]:
+    read_run = run_command(["crontab", "-l", "-u", user], progress, allow_fail=True, timeout=10)
+    if read_run.returncode != 0:
+        stderr = (read_run.stderr or "").lower()
+        if "no crontab for" in stderr:
+            return 0, []
+        return 0, [f"user crontab read failed for {user}: {(read_run.stderr or read_run.stdout).strip()}"]
+
+    original = read_run.stdout or ""
+    lines = original.splitlines()
+    removed = [line for line in lines if should_remove_cron_line(line, markers)]
+    if not removed:
+        return 0, []
+
+    cron_dir = evidence_dir / "cron"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    (cron_dir / f"{sanitize_slug(user)}.before.txt").write_text(original, encoding="utf-8")
+    (cron_dir / f"{sanitize_slug(user)}.removed.txt").write_text("\n".join(removed) + "\n", encoding="utf-8")
+
+    kept = [line for line in lines if not should_remove_cron_line(line, markers)]
+    if kept:
+        new_text = "\n".join(kept).rstrip() + "\n"
+        update = run_command(
+            ["crontab", "-u", user, "-"],
+            progress,
+            allow_fail=True,
+            timeout=10,
+            input_text=new_text,
+        )
+    else:
+        update = run_command(["crontab", "-r", "-u", user], progress, allow_fail=True, timeout=10)
+
+    if update.returncode != 0:
+        return 0, [f"user crontab update failed for {user}: {(update.stderr or update.stdout).strip()}"]
+    return len(removed), []
+
+
+def scrub_system_cron_file(path: Path, markers: set[str], evidence_dir: Path, progress: Progress) -> tuple[int, list[str]]:
+    if not path.exists() or not path.is_file():
+        return 0, []
+    try:
+        original = path.read_text(encoding="utf-8")
+    except Exception as err:
+        return 0, [f"failed to read {path}: {err}"]
+
+    lines = original.splitlines()
+    removed = [line for line in lines if should_remove_cron_line(line, markers)]
+    if not removed:
+        return 0, []
+
+    cron_dir = evidence_dir / "cron"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    backup_name = sanitize_slug(str(path).replace("/", "-"))
+    (cron_dir / f"{backup_name}.before.txt").write_text(original, encoding="utf-8")
+    (cron_dir / f"{backup_name}.removed.txt").write_text("\n".join(removed) + "\n", encoding="utf-8")
+
+    kept = [line for line in lines if not should_remove_cron_line(line, markers)]
+    rendered = "\n".join(kept).rstrip() + ("\n" if kept else "")
+    tmp_path = path.with_name(f".{path.name}.counterstrike-tmp")
+    stat_result = path.stat()
+    try:
+        tmp_path.write_text(rendered, encoding="utf-8")
+        os.chmod(tmp_path, stat_result.st_mode)
+        os.chown(tmp_path, stat_result.st_uid, stat_result.st_gid)
+        os.replace(tmp_path, path)
+        progress.append(f"Removed {len(removed)} cron line(s) from {path}")
+        return len(removed), []
+    except Exception as err:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return 0, [f"failed to update {path}: {err}"]
+
+
+def scrub_cron_references(candidates: list[Candidate], evidence_dir: Path, progress: Progress) -> tuple[int, list[str], list[str]]:
+    markers: set[str] = set()
+    users = {"root"}
+    for candidate in candidates:
+        markers.update(cron_matchers_for_candidate(candidate))
+        users.add(candidate.user or "root")
+
+    removed_total = 0
+    changed_targets: list[str] = []
+    errors: list[str] = []
+
+    for user in sorted(users):
+        removed, user_errors = scrub_user_crontab(user, markers, evidence_dir, progress)
+        removed_total += removed
+        if removed > 0:
+            changed_targets.append(f"user:{user}")
+        errors.extend(user_errors)
+
+    for system_path in SYSTEM_CRON_FILES:
+        removed, path_errors = scrub_system_cron_file(system_path, markers, evidence_dir, progress)
+        removed_total += removed
+        if removed > 0:
+            changed_targets.append(str(system_path))
+        errors.extend(path_errors)
+
+    for cron_dir in SYSTEM_CRON_DIRS:
+        if not cron_dir.is_dir():
+            continue
+        for child in sorted(cron_dir.iterdir()):
+            if not child.is_file():
+                continue
+            removed, path_errors = scrub_system_cron_file(child, markers, evidence_dir, progress)
+            removed_total += removed
+            if removed > 0:
+                changed_targets.append(str(child))
+            errors.extend(path_errors)
+
+    return removed_total, changed_targets, errors
+
+
+def cron_references_remaining(candidates: list[Candidate], progress: Progress | None = None) -> int:
+    markers: set[str] = set()
+    users = {"root"}
+    for candidate in candidates:
+        markers.update(cron_matchers_for_candidate(candidate))
+        users.add(candidate.user or "root")
+
+    remaining = 0
+    for user in sorted(users):
+        read_run = run_command(["crontab", "-l", "-u", user], progress, allow_fail=True, timeout=10)
+        if read_run.returncode == 0:
+            remaining += sum(1 for line in (read_run.stdout or "").splitlines() if should_remove_cron_line(line, markers))
+
+    for system_path in SYSTEM_CRON_FILES:
+        if system_path.is_file():
+            try:
+                remaining += sum(
+                    1
+                    for line in system_path.read_text(encoding="utf-8").splitlines()
+                    if should_remove_cron_line(line, markers)
+                )
+            except Exception:
+                pass
+
+    for cron_dir in SYSTEM_CRON_DIRS:
+        if not cron_dir.is_dir():
+            continue
+        for child in cron_dir.iterdir():
+            if not child.is_file():
+                continue
+            try:
+                remaining += sum(
+                    1
+                    for line in child.read_text(encoding="utf-8").splitlines()
+                    if should_remove_cron_line(line, markers)
+                )
+            except Exception:
+                continue
+
+    return remaining
+
+
+def refresh_snapshot(progress: Progress) -> list[str]:
+    errors: list[str] = []
+    for command in (["/usr/local/bin/vps-sentry"], ["/usr/local/bin/vps-sentry-publish"]):
+        try:
+            run_command(command, progress, allow_fail=False, timeout=max(COMMAND_TIMEOUT_SECONDS, 90))
+        except Exception as err:
+            errors.append(error_message(err))
+            break
+    return errors
+
+
+def build_summary(status: str, mode: str, candidate_count: int, quarantined_count: int, cron_removed: int) -> str:
+    if status == "analysis_only":
+        return f"Analyzed {candidate_count} candidate(s). No changes were made."
+    if status == "dry_run":
+        return f"Dry run matched {candidate_count} candidate(s) and would scrub {cron_removed} cron line(s)."
+    if status == "contained":
+        return (
+            f"Contained {candidate_count} candidate(s), quarantined {quarantined_count} executable(s), "
+            f"and removed {cron_removed} cron line(s)."
+        )
+    if status == "partial":
+        return f"Counterstrike partially completed against {candidate_count} candidate(s). Review follow-up is required."
+    if status == "blocked":
+        return "Counterstrike found no safe miner-persistence candidates to act on."
+    return "Counterstrike failed before the playbook could complete."
+
+
+def trim_history_runs() -> None:
+    if not RUNS_DIR.exists():
+        return
+    run_dirs = [path for path in RUNS_DIR.iterdir() if path.is_dir()]
+    run_dirs.sort(key=lambda path: path.name, reverse=True)
+    for stale in run_dirs[MAX_HISTORY_RUNS:]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def install_signal_handlers() -> None:
+    def handle_signal(signum: int, _frame: object) -> None:
+        raise SystemExit(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+
+def make_run_id() -> str:
+    return f"cs-{now_stamp()}-{os.getpid()}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Counterstrike host playbooks.")
+    parser.add_argument("--playbook", default=PLAYBOOK["id"])
+    parser.add_argument("--mode", choices=["analyze", "dry-run", "execute"], default="analyze")
+    parser.add_argument("--json", action="store_true")
+    return parser.parse_args()
+
+
+def acquire_lock() -> object:
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise RuntimeError("Counterstrike is already running.")
+    return handle
+
+
+def main() -> int:
+    install_signal_handlers()
+    args = parse_args()
+    if args.playbook != PLAYBOOK["id"]:
+        print(json.dumps({"ok": False, "error": "unsupported playbook"}))
+        return 2
+
+    run_id = make_run_id()
+    run_dir = RUNS_DIR / run_id
+    progress = Progress(run_id=run_id, mode=args.mode, playbook=PLAYBOOK, run_dir=run_dir)
+
+    try:
+        lock_handle = acquire_lock()
+    except Exception as err:
+        payload = {
+            "ok": False,
+            "status": "blocked",
+            "error": error_message(err),
+            "playbook": PLAYBOOK["id"],
+            "mode": args.mode,
+        }
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print(payload["error"], file=sys.stderr)
+        return 2
+
+    started_at = iso_utc_now()
+    errors: list[str] = []
+    status_source: dict[str, object] = {}
+    candidates: list[Candidate] = []
+    quarantined_paths: list[str] = []
+    changed_targets: list[str] = []
+    cron_removed = 0
+    status_value = "failed"
+    result_payload: dict[str, object] | None = None
+
+    try:
+        progress.append(f"Counterstrike started for {PLAYBOOK['label']} in {args.mode} mode.")
+
+        progress.set_phase("snapshot", "Collecting evidence snapshot", 1)
+        status_source = extract_status_source()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write_json(run_dir / "status-source.json", status_source)
+        candidates = extract_candidates(status_source)
+        armed = build_armed_state(status_source, candidates)
+        progress.armed = armed
+        progress.evidence_captured = True
+        progress.persist()
+        write_json(run_dir / "candidates.json", {"candidates": [candidate.to_dict() for candidate in candidates]})
+        progress.append(armed["reason"])
+
+        progress.set_phase("classify", "Classifying playbook targets", 2)
+        for candidate in candidates:
+            progress.append(
+                f"candidate pid={candidate.pid} user={candidate.user} proc={candidate.proc} exe={candidate.exe}"
+            )
+
+        if not candidates:
+            status_value = "blocked" if args.mode == "execute" else ("dry_run" if args.mode == "dry-run" else "analysis_only")
+        elif args.mode == "analyze":
+            status_value = "analysis_only"
+        elif args.mode == "dry-run":
+            status_value = "dry_run"
+            cron_removed = cron_references_remaining(candidates)
+        else:
+            progress.set_phase("neutralize", "Stopping suspicious runtime processes", 3)
+            for candidate in candidates:
+                capture_process_evidence(candidate, progress.evidence_dir, progress)
+                stopped_ok, stopped_detail = stop_process(candidate.pid, progress)
+                progress.append(f"pid {candidate.pid}: {stopped_detail}")
+                if not stopped_ok:
+                    errors.append(f"pid {candidate.pid}: {stopped_detail}")
+                    continue
+
+                quarantined_ok, quarantined_path, quarantine_detail = quarantine_executable(
+                    candidate, progress.evidence_dir, progress
+                )
+                progress.append(f"{candidate.exe}: {quarantine_detail}")
+                if quarantined_path:
+                    quarantined_paths.append(quarantined_path)
+                if not quarantined_ok:
+                    errors.append(f"{candidate.exe}: {quarantine_detail}")
+
+            progress.set_phase("harden", "Scrubbing matching cron persistence", 4)
+            cron_removed, changed_targets, cron_errors = scrub_cron_references(
+                candidates, progress.evidence_dir, progress
+            )
+            errors.extend(cron_errors)
+            progress.append(f"Removed {cron_removed} matching cron line(s).")
+
+            progress.set_phase("verify", "Refreshing VPS Sentry snapshot", 5)
+            refresh_errors = refresh_snapshot(progress)
+            errors.extend(refresh_errors)
+
+            remaining_pids = [candidate.pid for candidate in candidates if process_is_alive(candidate.pid)]
+            cron_remaining = cron_references_remaining(candidates)
+            if remaining_pids:
+                errors.append(f"{len(remaining_pids)} candidate pid(s) still appear alive: {remaining_pids}")
+            if cron_remaining > 0:
+                errors.append(f"{cron_remaining} cron reference(s) still match the playbook markers.")
+
+            if not errors and candidates:
+                status_value = "contained"
+            elif candidates:
+                status_value = "partial"
+            else:
+                status_value = "blocked"
+
+        progress.set_phase("record", "Writing battlefeed record", progress.total_steps)
+        finished_at = iso_utc_now()
+        summary = build_summary(
+            status_value,
+            args.mode,
+            len(candidates),
+            len(quarantined_paths),
+            cron_removed,
+        )
+        progress.append(summary)
+        result_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id,
+            "playbook": PLAYBOOK["id"],
+            "playbook_label": PLAYBOOK["label"],
+            "playbook_title": PLAYBOOK["title"],
+            "mode": args.mode,
+            "status": status_value,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "updated_at": finished_at,
+            "duration_seconds": elapsed_seconds(started_at),
+            "summary": summary,
+            "armed_before": progress.armed,
+            "host": as_str(status_source.get("host")) or None,
+            "snapshot_ts": as_str(status_source.get("ts")) or None,
+            "alerts_count": as_int(status_source.get("alerts_count")),
+            "evidence_captured": True,
+            "rollback_available": False,
+            "console_path": str(progress.console_path),
+            "evidence_dir": str(progress.evidence_dir),
+            "matched_candidates": [candidate.to_dict() for candidate in candidates],
+            "quarantined_paths": quarantined_paths,
+            "cron_removed_lines": cron_removed,
+            "cron_changed_targets": changed_targets,
+            "errors": errors,
+            "recent_lines": tail_lines(progress.console_path),
+        }
+        write_json(run_dir / "result.json", result_payload, mode=0o644)
+        write_json(LAST_JSON, result_payload, mode=0o644)
+        trim_history_runs()
+
+        if args.json:
+            print(json.dumps({"ok": status_value in {"analysis_only", "dry_run", "contained"}, **result_payload}))
+        return 0 if status_value in {"analysis_only", "dry_run", "contained"} else 1
+
+    except SystemExit as err:
+        errors.append(error_message(err))
+    except Exception as err:
+        errors.append(error_message(err))
+        progress.append(f"Counterstrike failed: {err}")
+    finally:
+        try:
+            if result_payload is None:
+                finished_at = iso_utc_now()
+                fallback = {
+                    "schema_version": SCHEMA_VERSION,
+                    "run_id": run_id,
+                    "playbook": PLAYBOOK["id"],
+                    "playbook_label": PLAYBOOK["label"],
+                    "playbook_title": PLAYBOOK["title"],
+                    "mode": args.mode,
+                    "status": status_value if status_value != "failed" else "failed",
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "updated_at": finished_at,
+                    "duration_seconds": elapsed_seconds(started_at),
+                    "summary": errors[0] if errors else "Counterstrike failed.",
+                    "armed_before": progress.armed,
+                    "host": as_str(status_source.get("host")) or None,
+                    "snapshot_ts": as_str(status_source.get("ts")) or None,
+                    "alerts_count": as_int(status_source.get("alerts_count")),
+                    "evidence_captured": progress.evidence_captured,
+                    "rollback_available": False,
+                    "console_path": str(progress.console_path),
+                    "evidence_dir": str(progress.evidence_dir),
+                    "matched_candidates": [candidate.to_dict() for candidate in candidates],
+                    "quarantined_paths": quarantined_paths,
+                    "cron_removed_lines": cron_removed,
+                    "cron_changed_targets": changed_targets,
+                    "errors": errors,
+                    "recent_lines": tail_lines(progress.console_path),
+                }
+                run_dir.mkdir(parents=True, exist_ok=True)
+                write_json(run_dir / "result.json", fallback, mode=0o644)
+                write_json(LAST_JSON, fallback, mode=0o644)
+        finally:
+            try:
+                RUNNING_JSON.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                lock_handle.close()
+            except Exception:
+                pass
+
+    if args.json:
+        last_payload = load_json(LAST_JSON) or {"ok": False, "status": "failed", "errors": errors}
+        print(json.dumps({"ok": False, **last_payload}))
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
