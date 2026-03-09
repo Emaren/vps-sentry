@@ -197,6 +197,7 @@ sudo install -m 0440 "$SUDOERS_SRC_DIR/90-vps-sentry-maintenance" /etc/sudoers.d
 
 sudo install -d -m 0755 /etc/systemd/system/vps-sentry-web.service.d
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-web.service.d/10-vps-sentry-events.conf" /etc/systemd/system/vps-sentry-web.service.d/10-vps-sentry-events.conf
+sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-web.service.d/40-garbage-cleanup-write-paths.conf" /etc/systemd/system/vps-sentry-web.service.d/40-garbage-cleanup-write-paths.conf
 sudo install -d -m 0755 /etc/systemd/system/vps-sentry-ops-worker.service.d
 sudo install -m 0644 "$UNIT_SRC_DIR/vps-sentry-ops-worker.service.d/10-vps-sentry-events.conf" /etc/systemd/system/vps-sentry-ops-worker.service.d/10-vps-sentry-events.conf
 sudo install -d -m 0755 /etc/systemd/system/nginx.service.d

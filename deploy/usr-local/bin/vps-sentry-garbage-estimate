@@ -631,6 +631,12 @@ def publish_public() -> None:
         log(f"warn: publish refresh failed: {exc}")
 
 
+def publish_snapshot(snapshot: dict[str, object]) -> None:
+    write_json(CACHE_JSON, snapshot, 0o600)
+    merge_into_last(snapshot)
+    publish_public()
+
+
 def estimate_snapshot(force: bool) -> dict[str, object]:
     last_cleanup_result = load_json(LAST_CLEANUP_JSON)
     cached = load_json(CACHE_JSON)
@@ -692,6 +698,21 @@ def cleanup_result_for_error(message: str) -> dict[str, object]:
     }
 
 
+def running_snapshot(last_cleanup_result: dict[str, object] | None) -> dict[str, object]:
+    cached = load_json(CACHE_JSON) or {}
+    snapshot = dict(cached)
+    snapshot.setdefault("schema_version", SCHEMA_VERSION)
+    snapshot.setdefault("measured_at", iso_utc_now())
+    snapshot.setdefault("ttl_seconds", TTL_SECONDS)
+    snapshot.setdefault("reclaimable_bytes_total", 0)
+    snapshot.setdefault("safe_reclaimable_bytes", 0)
+    snapshot.setdefault("buckets", [])
+    snapshot.setdefault("top_paths", [])
+    snapshot["running_cleanup"] = True
+    snapshot["last_cleanup_result"] = last_cleanup_result
+    return snapshot
+
+
 def run_reclaim() -> tuple[int, dict[str, object]]:
     started_at = iso_utc_now()
     running_payload = {
@@ -699,6 +720,7 @@ def run_reclaim() -> tuple[int, dict[str, object]]:
         "state": "running",
     }
     write_json(RUNNING_JSON, running_payload, 0o600)
+    publish_snapshot(running_snapshot(load_json(LAST_CLEANUP_JSON)))
 
     before_available = measure_disk_available_bytes("/")
     candidates = collect_candidates()
@@ -752,9 +774,7 @@ def run_reclaim() -> tuple[int, dict[str, object]]:
         pass
 
     snapshot = summarize_candidates(collect_candidates(), result)
-    write_json(CACHE_JSON, snapshot, 0o600)
-    merge_into_last(snapshot)
-    publish_public()
+    publish_snapshot(snapshot)
     result["estimate"] = snapshot
     return (0 if result["ok"] else 1), result
 
