@@ -16,6 +16,8 @@ TOOLS=(
   vps-sentry-app-sanity
   vps-sentry-evidence-seal
   vps-sentry-evidence-verify
+  vps-sentry-garbage-estimate
+  vps-sentry-garbage-reclaim
   vps-sentry-maintenance
   vps-sentry-notify
   vps-sentry-ports-normalize

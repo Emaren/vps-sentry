@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("VPS_SENTRY_STATE_DIR", "/var/lib/vps-sentry"))
+LAST_JSON = STATE_DIR / "last.json"
+CACHE_JSON = STATE_DIR / "garbage-estimate.json"
+LAST_CLEANUP_JSON = STATE_DIR / "garbage-last-cleanup.json"
+LOCK_FILE = STATE_DIR / ".garbage.lock"
+RUNNING_JSON = STATE_DIR / "garbage-running-cleanup.json"
+TTL_SECONDS = max(60, int(os.environ.get("VPS_SENTRY_GARBAGE_TTL_SECONDS", "600")))
+TMP_MIN_AGE_HOURS = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_TMP_MIN_AGE_HOURS", "24")))
+NEXT_OLDPACK_MIN_AGE_HOURS = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_NEXT_OLDPACK_MIN_AGE_HOURS", "2")))
+VSIX_MIN_AGE_HOURS = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_VSIX_MIN_AGE_HOURS", "6")))
+PACKAGE_CACHE_MIN_BYTES = max(
+    0, int(os.environ.get("VPS_SENTRY_GARBAGE_PACKAGE_CACHE_MIN_BYTES", str(50 * 1024 * 1024)))
+)
+APT_CACHE_MIN_BYTES = max(
+    0, int(os.environ.get("VPS_SENTRY_GARBAGE_APT_CACHE_MIN_BYTES", str(50 * 1024 * 1024)))
+)
+JOURNAL_TARGET_BYTES = max(
+    32 * 1024 * 1024,
+    int(os.environ.get("VPS_SENTRY_GARBAGE_JOURNAL_TARGET_BYTES", str(200 * 1024 * 1024))),
+)
+BACKUP_KEEP = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP", "5")))
+TOP_PATHS_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_TOP_PATHS_LIMIT", "8")))
+SCHEMA_VERSION = 1
+
+TMP_NAME_PREFIXES = (
+    "tmp.",
+    "yarn--",
+    "v8-compile-cache-",
+    "tsx-",
+    "npm-",
+    "pnpm-",
+)
+TMP_NAME_EXACT = {
+    "node-compile-cache",
+}
+EXTENSION_VERSION_RE = re.compile(r"^(?P<base>.+)-(?P<version>\d[\w.+-]*)$")
+
+PACKAGE_CACHE_SUFFIXES = (
+    ".npm",
+    ".cache/pnpm",
+    ".cache/yarn",
+    ".cache/Corepack",
+    ".cache/corepack",
+    ".cache/pip",
+    ".local/share/pnpm/store",
+)
+
+
+def log(message: str) -> None:
+    print(f"[VPS-GARBAGE] {message}", file=sys.stderr)
+
+
+def iso_utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(ts: object) -> datetime | None:
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    raw = ts.strip()
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def parse_csv_paths(raw: str | None) -> list[Path]:
+    if not raw:
+        return []
+    out: list[Path] = []
+    for part in raw.split(","):
+        candidate = Path(part.strip())
+        if not str(candidate).strip():
+            continue
+        out.append(candidate)
+    return out
+
+
+def default_home_roots() -> list[Path]:
+    out: list[Path] = []
+    if Path("/root").exists():
+        out.append(Path("/root"))
+    home_root = Path("/home")
+    if home_root.is_dir():
+        for child in sorted(home_root.iterdir()):
+            if child.is_dir():
+                out.append(child)
+    return out
+
+
+def home_roots() -> list[Path]:
+    configured = parse_csv_paths(os.environ.get("VPS_SENTRY_GARBAGE_HOME_ROOTS"))
+    roots = configured or default_home_roots()
+    return [root for root in roots if root.exists() and root.is_dir()]
+
+
+def scan_roots() -> list[Path]:
+    configured = parse_csv_paths(os.environ.get("VPS_SENTRY_GARBAGE_SCAN_ROOTS"))
+    roots = configured or [Path("/var/www"), Path("/root"), Path("/home")]
+    return [root for root in roots if root.exists()]
+
+
+def backup_roots() -> list[Path]:
+    configured = parse_csv_paths(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_DIRS"))
+    if configured:
+        return [root for root in configured if root.exists() and root.is_dir()]
+    defaults = [Path("/home/tony/_backup/vps-sentry-web")]
+    return [root for root in defaults if root.exists() and root.is_dir()]
+
+
+def age_seconds_for(path: Path) -> float:
+    try:
+        return max(0.0, datetime.now(timezone.utc).timestamp() - path.stat(follow_symlinks=False).st_mtime)
+    except OSError:
+        return 0.0
+
+
+def load_json(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def write_json(path: Path, payload: dict[str, object], mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent)) as tmp:
+        json.dump(payload, tmp, indent=2, sort_keys=True)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
+
+
+def walk_path_usage(path: Path) -> dict[str, int]:
+    try:
+        root_stat = path.stat(follow_symlinks=False)
+    except OSError:
+        return {"disk_bytes": 0, "apparent_bytes": 0, "file_count": 0}
+
+    root_dev = root_stat.st_dev
+    disk_bytes = getattr(root_stat, "st_blocks", 0) * 512 or root_stat.st_size
+    apparent_bytes = root_stat.st_size
+    file_count = 0
+
+    if path.is_file() or path.is_symlink():
+        return {
+            "disk_bytes": disk_bytes,
+            "apparent_bytes": apparent_bytes,
+            "file_count": 1,
+        }
+
+    for dirpath, dirnames, filenames in os.walk(path, topdown=True, followlinks=False):
+        current_dir = Path(dirpath)
+        kept_dirs: list[str] = []
+
+        for name in dirnames:
+            child = current_dir / name
+            try:
+                if child.is_symlink():
+                    continue
+                st = child.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
+            apparent_bytes += st.st_size
+            kept_dirs.append(name)
+        dirnames[:] = kept_dirs
+
+        for name in filenames:
+            child = current_dir / name
+            try:
+                st = child.lstat() if child.is_symlink() else child.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
+            apparent_bytes += st.st_size
+            file_count += 1
+
+    return {
+        "disk_bytes": disk_bytes,
+        "apparent_bytes": apparent_bytes,
+        "file_count": file_count,
+    }
+
+
+def path_disk_bytes(path: Path) -> int:
+    return walk_path_usage(path)["disk_bytes"]
+
+
+def find_matches(root: Path, pattern: str) -> list[tuple[int, float, Path]]:
+    try:
+        completed = subprocess.run(
+            ["find", str(root), "-xdev", "-type", "f", "-path", pattern, "-printf", "%s\t%T@\t%p\n"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+
+    out: list[tuple[int, float, Path]] = []
+    for line in completed.stdout.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            size_text, mtime_text, path_text = raw.split("\t", 2)
+            out.append((int(size_text), float(mtime_text), Path(path_text)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def measure_disk_available_bytes(path: str = "/") -> int:
+    usage = shutil.disk_usage(path)
+    return int(usage.free)
+
+
+def journal_disk_usage_bytes() -> int | None:
+    try:
+        completed = subprocess.run(
+            ["journalctl", "--disk-usage"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    match = re.search(r"([0-9.]+)\s*([KMGTP]?B)", completed.stdout, re.IGNORECASE)
+    if not match:
+        return None
+
+    amount = float(match.group(1))
+    unit = match.group(2).upper()
+    scale = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024 * 1024,
+        "GB": 1024 * 1024 * 1024,
+        "TB": 1024 * 1024 * 1024 * 1024,
+        "PB": 1024 * 1024 * 1024 * 1024 * 1024,
+    }.get(unit)
+    if not scale:
+        return None
+    return int(amount * scale)
+
+
+def candidate(
+    *,
+    key: str,
+    label: str,
+    path: Path | str,
+    bytes_value: int,
+    action: str,
+    kind: str,
+) -> dict[str, object]:
+    path_obj = Path(path) if not isinstance(path, Path) else path
+    path_text = str(path_obj)
+    candidate_id = f"{action}:{path_obj.resolve() if path_obj.exists() else path_text}"
+    return {
+        "id": candidate_id,
+        "key": key,
+        "label": label,
+        "path": path_text,
+        "bytes": max(0, int(bytes_value)),
+        "action": action,
+        "kind": kind,
+    }
+
+
+def dedupe_candidates(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    by_id: dict[str, dict[str, object]] = {}
+    for item in items:
+        raw_id = str(item.get("id") or "").strip()
+        if not raw_id:
+            continue
+        prev = by_id.get(raw_id)
+        if prev is None or int(item.get("bytes") or 0) > int(prev.get("bytes") or 0):
+            by_id[raw_id] = item
+    return list(by_id.values())
+
+
+def scan_tmp_candidates() -> list[dict[str, object]]:
+    min_age_seconds = TMP_MIN_AGE_HOURS * 3600
+    out: list[dict[str, object]] = []
+    for root in (Path("/tmp"), Path("/var/tmp")):
+        if not root.is_dir():
+            continue
+        for child in root.iterdir():
+            name = child.name
+            if not (name in TMP_NAME_EXACT or any(name.startswith(prefix) for prefix in TMP_NAME_PREFIXES)):
+                continue
+            if age_seconds_for(child) < min_age_seconds:
+                continue
+            bytes_value = path_disk_bytes(child)
+            if bytes_value <= 0:
+                continue
+            out.append(
+                candidate(
+                    key="tmp_stale",
+                    label="Stale /tmp files",
+                    path=child,
+                    bytes_value=bytes_value,
+                    action="remove_path",
+                    kind="path",
+                )
+            )
+    return out
+
+
+def scan_next_oldpacks() -> list[dict[str, object]]:
+    min_age_seconds = NEXT_OLDPACK_MIN_AGE_HOURS * 3600
+    out: list[dict[str, object]] = []
+    for root in scan_roots():
+        for size, mtime_epoch, path in find_matches(root, "*/.next/cache/webpack/*/index.pack.old"):
+            if datetime.now(timezone.utc).timestamp() - mtime_epoch < min_age_seconds:
+                continue
+            out.append(
+                candidate(
+                    key="next_oldpacks",
+                    label="Dead Next.js old cache packs",
+                    path=path,
+                    bytes_value=size,
+                    action="remove_path",
+                    kind="path",
+                )
+            )
+    return out
+
+
+def scan_vscode_old_bins() -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for home in home_roots():
+        bin_root = home / ".vscode-server" / "bin"
+        if not bin_root.is_dir():
+            continue
+        versions = [child for child in bin_root.iterdir() if child.is_dir() and not child.is_symlink()]
+        if len(versions) <= 1:
+            continue
+        versions.sort(key=lambda item: item.stat(follow_symlinks=False).st_mtime, reverse=True)
+        for old in versions[1:]:
+            bytes_value = path_disk_bytes(old)
+            if bytes_value <= 0:
+                continue
+            out.append(
+                candidate(
+                    key="vscode_old",
+                    label="Old VS Code server versions",
+                    path=old,
+                    bytes_value=bytes_value,
+                    action="remove_path",
+                    kind="path",
+                )
+            )
+    return out
+
+
+def extension_family(name: str) -> str | None:
+    match = EXTENSION_VERSION_RE.match(name)
+    if not match:
+        return None
+    return str(match.group("base") or "").strip() or None
+
+
+def scan_vscode_old_extensions() -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for home in home_roots():
+        ext_root = home / ".vscode-server" / "extensions"
+        if not ext_root.is_dir():
+            continue
+        grouped: dict[str, list[Path]] = {}
+        for child in ext_root.iterdir():
+            if not child.is_dir() or child.is_symlink():
+                continue
+            family = extension_family(child.name)
+            if not family:
+                continue
+            grouped.setdefault(family, []).append(child)
+        for _, versions in grouped.items():
+            if len(versions) <= 1:
+                continue
+            versions.sort(key=lambda item: item.stat(follow_symlinks=False).st_mtime, reverse=True)
+            for old in versions[1:]:
+                bytes_value = path_disk_bytes(old)
+                if bytes_value <= 0:
+                    continue
+                out.append(
+                    candidate(
+                        key="vscode_extensions_old",
+                        label="Old VS Code extension versions",
+                        path=old,
+                        bytes_value=bytes_value,
+                        action="remove_path",
+                        kind="path",
+                    )
+                )
+    return out
+
+
+def scan_vsix_cache() -> list[dict[str, object]]:
+    min_age_seconds = VSIX_MIN_AGE_HOURS * 3600
+    out: list[dict[str, object]] = []
+    for home in home_roots():
+        cache_root = home / ".vscode-server" / "data" / "CachedExtensionVSIXs"
+        if not cache_root.is_dir():
+            continue
+        for child in cache_root.iterdir():
+            if age_seconds_for(child) < min_age_seconds:
+                continue
+            bytes_value = path_disk_bytes(child)
+            if bytes_value <= 0:
+                continue
+            out.append(
+                candidate(
+                    key="vscode_cache",
+                    label="VS Code cached VSIX downloads",
+                    path=child,
+                    bytes_value=bytes_value,
+                    action="remove_path",
+                    kind="path",
+                )
+            )
+    return out
+
+
+def scan_package_caches() -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for home in home_roots():
+        for suffix in PACKAGE_CACHE_SUFFIXES:
+            target = home / suffix
+            if not target.exists():
+                continue
+            bytes_value = path_disk_bytes(target)
+            if bytes_value < PACKAGE_CACHE_MIN_BYTES:
+                continue
+            out.append(
+                candidate(
+                    key="pkg_cache",
+                    label="Package manager caches",
+                    path=target,
+                    bytes_value=bytes_value,
+                    action="remove_path",
+                    kind="path",
+                )
+            )
+    return out
+
+
+def scan_apt_cache() -> list[dict[str, object]]:
+    apt_root = Path("/var/cache/apt/archives")
+    if not apt_root.exists():
+        return []
+    bytes_value = path_disk_bytes(apt_root)
+    if bytes_value < APT_CACHE_MIN_BYTES:
+        return []
+    return [
+        candidate(
+            key="apt_cache",
+            label="APT package cache",
+            path=apt_root,
+            bytes_value=bytes_value,
+            action="apt_clean",
+            kind="command",
+        )
+    ]
+
+
+def scan_journal_excess() -> list[dict[str, object]]:
+    usage = journal_disk_usage_bytes()
+    if usage is None or usage <= JOURNAL_TARGET_BYTES:
+        return []
+    return [
+        candidate(
+            key="journald_excess",
+            label="Journal logs above cap",
+            path=Path("/var/log/journal"),
+            bytes_value=max(0, usage - JOURNAL_TARGET_BYTES),
+            action="journal_vacuum",
+            kind="command",
+        )
+    ]
+
+
+def scan_backup_retention() -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    suffixes = (".tgz", ".tar.gz", ".zip")
+    for root in backup_roots():
+        archives = [
+            child
+            for child in root.iterdir()
+            if child.is_file() and any(child.name.endswith(suffix) for suffix in suffixes)
+        ]
+        if len(archives) <= BACKUP_KEEP:
+            continue
+        archives.sort(key=lambda item: item.stat(follow_symlinks=False).st_mtime, reverse=True)
+        for old in archives[BACKUP_KEEP:]:
+            bytes_value = path_disk_bytes(old)
+            if bytes_value <= 0:
+                continue
+            out.append(
+                candidate(
+                    key="backup_prune",
+                    label="Backup retention pruning",
+                    path=old,
+                    bytes_value=bytes_value,
+                    action="remove_path",
+                    kind="path",
+                )
+            )
+    return out
+
+
+def collect_candidates() -> list[dict[str, object]]:
+    return dedupe_candidates(
+        scan_tmp_candidates()
+        + scan_next_oldpacks()
+        + scan_vscode_old_bins()
+        + scan_vscode_old_extensions()
+        + scan_vsix_cache()
+        + scan_package_caches()
+        + scan_apt_cache()
+        + scan_journal_excess()
+        + scan_backup_retention()
+    )
+
+
+def summarize_candidates(
+    candidates: list[dict[str, object]], last_cleanup_result: dict[str, object] | None
+) -> dict[str, object]:
+    measured_at = iso_utc_now()
+    buckets: dict[str, dict[str, object]] = {}
+    top_paths: list[dict[str, object]] = []
+
+    for item in candidates:
+        key = str(item["key"])
+        label = str(item["label"])
+        bytes_value = int(item["bytes"])
+        bucket = buckets.setdefault(
+            key,
+            {
+                "key": key,
+                "label": label,
+                "bytes": 0,
+                "count": 0,
+            },
+        )
+        bucket["bytes"] = int(bucket["bytes"]) + bytes_value
+        bucket["count"] = int(bucket["count"]) + 1
+        top_paths.append(
+            {
+                "path": str(item["path"]),
+                "bytes": bytes_value,
+                "bucket": key,
+            }
+        )
+
+    bucket_rows = sorted(
+        buckets.values(),
+        key=lambda row: (-int(row["bytes"]), str(row["label"])),
+    )
+    top_paths.sort(key=lambda row: (-int(row["bytes"]), str(row["path"])))
+
+    reclaimable_bytes_total = sum(int(item["bytes"]) for item in candidates)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "measured_at": measured_at,
+        "ttl_seconds": TTL_SECONDS,
+        "reclaimable_bytes_total": reclaimable_bytes_total,
+        "safe_reclaimable_bytes": reclaimable_bytes_total,
+        "buckets": bucket_rows,
+        "top_paths": top_paths[:TOP_PATHS_LIMIT],
+        "running_cleanup": RUNNING_JSON.exists(),
+        "last_cleanup_result": last_cleanup_result,
+    }
+
+
+def cache_is_fresh(snapshot: dict[str, object]) -> bool:
+    measured_at = parse_iso(snapshot.get("measured_at"))
+    if measured_at is None:
+        return False
+    age_seconds = (datetime.now(timezone.utc) - measured_at).total_seconds()
+    return age_seconds < TTL_SECONDS
+
+
+def merge_into_last(snapshot: dict[str, object]) -> None:
+    if not LAST_JSON.exists():
+        log(f"warn: missing {LAST_JSON}; skipping merge")
+        return
+    payload = load_json(LAST_JSON)
+    if payload is None:
+        log(f"warn: unable to parse {LAST_JSON}; skipping merge")
+        return
+    payload["garbage_estimate"] = snapshot
+    write_json(LAST_JSON, payload, 0o644)
+
+
+def publish_public() -> None:
+    publish_path = Path("/usr/local/bin/vps-sentry-publish")
+    if not publish_path.exists():
+        log("warn: /usr/local/bin/vps-sentry-publish missing; public status not refreshed")
+        return
+    try:
+        subprocess.run([str(publish_path)], check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        log(f"warn: publish refresh failed: {exc}")
+
+
+def estimate_snapshot(force: bool) -> dict[str, object]:
+    last_cleanup_result = load_json(LAST_CLEANUP_JSON)
+    cached = load_json(CACHE_JSON)
+    if not force and cached and cache_is_fresh(cached):
+        cached["running_cleanup"] = RUNNING_JSON.exists()
+        cached["last_cleanup_result"] = last_cleanup_result
+        return cached
+
+    snapshot = summarize_candidates(collect_candidates(), last_cleanup_result)
+    write_json(CACHE_JSON, snapshot, 0o600)
+    return snapshot
+
+
+def run_cleanup_command(args: list[str]) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(args, check=True, capture_output=True, text=True)
+        return True, completed.stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return False, str(exc)
+
+
+def remove_path(target: Path) -> tuple[bool, str]:
+    try:
+        if target.is_symlink() or target.is_file():
+            target.unlink(missing_ok=True)
+        elif target.is_dir():
+            shutil.rmtree(target, ignore_errors=False)
+        else:
+            target.unlink(missing_ok=True)
+        return True, ""
+    except FileNotFoundError:
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def apply_candidate(item: dict[str, object]) -> tuple[bool, str]:
+    action = str(item.get("action") or "")
+    target = Path(str(item.get("path") or ""))
+    if action == "remove_path":
+        return remove_path(target)
+    if action == "apt_clean":
+        return run_cleanup_command(["apt-get", "clean"])
+    if action == "journal_vacuum":
+        return run_cleanup_command(["journalctl", f"--vacuum-size={JOURNAL_TARGET_BYTES}"])
+    return False, f"unsupported action: {action}"
+
+
+def cleanup_result_for_error(message: str) -> dict[str, object]:
+    return {
+        "ok": False,
+        "started_at": iso_utc_now(),
+        "finished_at": iso_utc_now(),
+        "freed_bytes_estimated": 0,
+        "freed_bytes_actual": 0,
+        "deleted_count": 0,
+        "buckets": [],
+        "errors": [message],
+    }
+
+
+def run_reclaim() -> tuple[int, dict[str, object]]:
+    started_at = iso_utc_now()
+    running_payload = {
+        "started_at": started_at,
+        "state": "running",
+    }
+    write_json(RUNNING_JSON, running_payload, 0o600)
+
+    before_available = measure_disk_available_bytes("/")
+    candidates = collect_candidates()
+    bucket_rows: dict[str, dict[str, object]] = {}
+    errors: list[str] = []
+    deleted_count = 0
+    freed_bytes_estimated = 0
+
+    for item in candidates:
+        key = str(item["key"])
+        label = str(item["label"])
+        bytes_value = int(item["bytes"])
+        bucket = bucket_rows.setdefault(
+            key,
+            {
+                "key": key,
+                "label": label,
+                "estimated_bytes": 0,
+                "deleted_count": 0,
+            },
+        )
+        bucket["estimated_bytes"] = int(bucket["estimated_bytes"]) + bytes_value
+        freed_bytes_estimated += bytes_value
+
+        ok, detail = apply_candidate(item)
+        if ok:
+            deleted_count += 1
+            bucket["deleted_count"] = int(bucket["deleted_count"]) + 1
+        elif detail:
+            errors.append(f"{item['path']}: {detail}")
+
+    after_available = measure_disk_available_bytes("/")
+    finished_at = iso_utc_now()
+    freed_bytes_actual = max(0, after_available - before_available)
+
+    result = {
+        "ok": len(errors) == 0,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "freed_bytes_estimated": freed_bytes_estimated,
+        "freed_bytes_actual": freed_bytes_actual,
+        "deleted_count": deleted_count,
+        "buckets": sorted(bucket_rows.values(), key=lambda row: (-int(row["estimated_bytes"]), str(row["label"]))),
+        "errors": errors,
+    }
+
+    write_json(LAST_CLEANUP_JSON, result, 0o600)
+    try:
+        RUNNING_JSON.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    snapshot = summarize_candidates(collect_candidates(), result)
+    write_json(CACHE_JSON, snapshot, 0o600)
+    merge_into_last(snapshot)
+    publish_public()
+    result["estimate"] = snapshot
+    return (0 if result["ok"] else 1), result
+
+
+def acquire_lock(nonblocking: bool):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_FILE.open("a+")
+    import fcntl
+
+    flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    fcntl.flock(handle.fileno(), flags)
+    return handle
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Estimate or reclaim safe garbage on the VPS.")
+    parser.add_argument("--force", action="store_true", help="Ignore cache TTL and rescan now.")
+    parser.add_argument("--json", action="store_true", help="Print resulting JSON payload to stdout.")
+    parser.add_argument("--reclaim", action="store_true", help="Delete matched safe garbage and refresh the estimate.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    try:
+        lock_handle = acquire_lock(nonblocking=args.reclaim)
+    except BlockingIOError:
+        payload = cleanup_result_for_error("garbage cleanup already running")
+        if args.json:
+            json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+        else:
+            log("cleanup already running")
+        return 1
+
+    with lock_handle:
+        if args.reclaim:
+            status, payload = run_reclaim()
+        else:
+            payload = estimate_snapshot(force=args.force)
+            merge_into_last(payload)
+            status = 0
+
+        if args.json:
+            json.dump(payload, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+
+        return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

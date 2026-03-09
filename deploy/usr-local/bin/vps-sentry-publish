@@ -52,6 +52,9 @@ if not isinstance(vitals, dict):
 project_storage = data.get("project_storage")
 if not isinstance(project_storage, dict):
     project_storage = None
+garbage_estimate = data.get("garbage_estimate")
+if not isinstance(garbage_estimate, dict):
+    garbage_estimate = None
 
 public = {
   "ts": data.get("ts"),
@@ -70,6 +73,7 @@ public = {
   "threat": threat,
   "vitals": vitals,
   "project_storage": project_storage,
+  "garbage_estimate": garbage_estimate,
 }
 
 print(json.dumps(public, indent=2, sort_keys=True))
