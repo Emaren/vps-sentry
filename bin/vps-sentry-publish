@@ -12,6 +12,7 @@ fail() { log "FAIL: $*"; exit 2; }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PORTS_NORMALIZE="$SCRIPT_DIR/vps-sentry-ports-normalize"
+STATUS_MERGE="$SCRIPT_DIR/vps-sentry-status-merge"
 
 STATE="/var/lib/vps-sentry"
 PUB="$STATE/public"
@@ -66,6 +67,7 @@ public = {
     "ssh_invalid_user": auth.get("ssh_invalid_user", 0),
     "new_ssh_accepts_count": len(new_ssh),
   },
+  "ports_local": data.get("ports_local", []) or [],
   "ports_public": data.get("ports_public", []) or [],
   "public_ports_count": data.get("public_ports_count"),
   "alerts": alerts,
@@ -99,6 +101,10 @@ install -m 0644 -o root -g root "$DIFF"   "$PUB/diff.json"
 #    is invoked manually outside the full systemd post-processing chain.
 if [[ -x "$PORTS_NORMALIZE" ]]; then
   "$PORTS_NORMALIZE" || log "WARN: ports normalize failed"
+fi
+
+if [[ -x "$STATUS_MERGE" ]]; then
+  "$STATUS_MERGE" || log "WARN: status merge failed"
 fi
 
 log "OK: published $(stat -c '%s' "$PUB/last.json")B last.json, $(stat -c '%s' "$PUB/status.json")B status.json, $(stat -c '%s' "$PUB/diff.json")B diff.json"

@@ -32,6 +32,7 @@ JOURNAL_TARGET_BYTES = max(
 )
 BACKUP_KEEP = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP", "5")))
 TOP_PATHS_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_TOP_PATHS_LIMIT", "8")))
+PROGRESS_RECENT_LINES_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_PROGRESS_LINES", "6")))
 SCHEMA_VERSION = 1
 
 TMP_NAME_PREFIXES = (
@@ -698,7 +699,79 @@ def cleanup_result_for_error(message: str) -> dict[str, object]:
     }
 
 
-def running_snapshot(last_cleanup_result: dict[str, object] | None) -> dict[str, object]:
+def trim_recent_lines(lines: list[str]) -> list[str]:
+    out = [line.strip() for line in lines if isinstance(line, str) and line.strip()]
+    return out[-PROGRESS_RECENT_LINES_LIMIT:]
+
+
+def command_preview(item: dict[str, object]) -> str:
+    action = str(item.get("action") or "").strip()
+    path = str(item.get("path") or "").strip()
+    if action == "remove_path":
+        return f"rm -rf {path}"
+    if action == "apt_clean":
+        return "apt-get clean"
+    if action == "journal_vacuum":
+        return f"journalctl --vacuum-size={JOURNAL_TARGET_BYTES}"
+    return action or "cleanup"
+
+
+def estimate_eta_seconds(started_at: str, completed_steps: int | None, total_steps: int | None) -> int | None:
+    if not completed_steps or not total_steps or completed_steps <= 0 or total_steps <= completed_steps:
+        return None
+    started = parse_iso(started_at)
+    if started is None:
+        return None
+    elapsed_seconds = max(1.0, (datetime.now(timezone.utc) - started).total_seconds())
+    remaining_steps = max(0, total_steps - completed_steps)
+    if remaining_steps <= 0:
+        return None
+    return max(1, int(round((elapsed_seconds / completed_steps) * remaining_steps)))
+
+
+def build_running_progress(
+    *,
+    started_at: str,
+    phase: str,
+    current_label: str,
+    current_target: str | None,
+    current_command: str | None,
+    completed_steps: int | None,
+    total_steps: int | None,
+    errors_count: int,
+    recent_lines: list[str],
+) -> dict[str, object]:
+    eta_seconds = estimate_eta_seconds(started_at, completed_steps, total_steps)
+    return {
+        "started_at": started_at,
+        "updated_at": iso_utc_now(),
+        "phase": phase,
+        "current_label": current_label,
+        "current_target": current_target,
+        "current_command": current_command,
+        "completed_steps": completed_steps,
+        "total_steps": total_steps,
+        "errors_count": errors_count,
+        "eta_seconds": eta_seconds,
+        "recent_lines": trim_recent_lines(recent_lines),
+    }
+
+
+def write_running_progress(
+    progress: dict[str, object],
+    last_cleanup_result: dict[str, object] | None,
+    *,
+    publish: bool,
+) -> None:
+    write_json(RUNNING_JSON, progress, 0o600)
+    if publish:
+        publish_snapshot(running_snapshot(last_cleanup_result, progress))
+
+
+def running_snapshot(
+    last_cleanup_result: dict[str, object] | None,
+    progress: dict[str, object] | None = None,
+) -> dict[str, object]:
     cached = load_json(CACHE_JSON) or {}
     snapshot = dict(cached)
     snapshot.setdefault("schema_version", SCHEMA_VERSION)
@@ -710,29 +783,63 @@ def running_snapshot(last_cleanup_result: dict[str, object] | None) -> dict[str,
     snapshot.setdefault("top_paths", [])
     snapshot["running_cleanup"] = True
     snapshot["last_cleanup_result"] = last_cleanup_result
+    snapshot["cleanup_progress"] = progress
     return snapshot
 
 
 def run_reclaim() -> tuple[int, dict[str, object]]:
     started_at = iso_utc_now()
-    running_payload = {
-        "started_at": started_at,
-        "state": "running",
-    }
-    write_json(RUNNING_JSON, running_payload, 0o600)
-    publish_snapshot(running_snapshot(load_json(LAST_CLEANUP_JSON)))
+    recent_lines = ["$ scan safe garbage candidates"]
+    write_running_progress(
+        build_running_progress(
+            started_at=started_at,
+            phase="scanning",
+            current_label="Scanning safe cleanup candidates",
+            current_target=None,
+            current_command="scan safe garbage candidates",
+            completed_steps=0,
+            total_steps=None,
+            errors_count=0,
+            recent_lines=recent_lines,
+        ),
+        load_json(LAST_CLEANUP_JSON),
+        publish=True,
+    )
 
     before_available = measure_disk_available_bytes("/")
     candidates = collect_candidates()
+    total_steps = len(candidates) + 1
     bucket_rows: dict[str, dict[str, object]] = {}
     errors: list[str] = []
     deleted_count = 0
     freed_bytes_estimated = 0
+    processed_steps = 0
+
+    if not candidates:
+        recent_lines.append("no safe garbage matched")
 
     for item in candidates:
         key = str(item["key"])
         label = str(item["label"])
         bytes_value = int(item["bytes"])
+        command_text = command_preview(item)
+        recent_lines.append(f"$ {command_text}")
+        write_running_progress(
+            build_running_progress(
+                started_at=started_at,
+                phase="reclaiming",
+                current_label=label,
+                current_target=str(item.get("path") or "") or None,
+                current_command=command_text,
+                completed_steps=processed_steps,
+                total_steps=total_steps,
+                errors_count=len(errors),
+                recent_lines=recent_lines,
+            ),
+            load_json(LAST_CLEANUP_JSON),
+            publish=False,
+        )
+
         bucket = bucket_rows.setdefault(
             key,
             {
@@ -749,8 +856,28 @@ def run_reclaim() -> tuple[int, dict[str, object]]:
         if ok:
             deleted_count += 1
             bucket["deleted_count"] = int(bucket["deleted_count"]) + 1
+            recent_lines.append(f"deleted {label} ({bytes_value}B)")
         elif detail:
             errors.append(f"{item['path']}: {detail}")
+            recent_lines.append(f"error: {detail}")
+        processed_steps += 1
+
+    recent_lines.append("$ rescan reclaimable space")
+    write_running_progress(
+        build_running_progress(
+            started_at=started_at,
+            phase="rescanning",
+            current_label="Re-scanning reclaimable space",
+            current_target=None,
+            current_command="scan safe garbage candidates",
+            completed_steps=processed_steps,
+            total_steps=total_steps,
+            errors_count=len(errors),
+            recent_lines=recent_lines,
+        ),
+        load_json(LAST_CLEANUP_JSON),
+        publish=False,
+    )
 
     after_available = measure_disk_available_bytes("/")
     finished_at = iso_utc_now()
