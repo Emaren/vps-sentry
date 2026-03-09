@@ -502,6 +502,74 @@ def should_remove_cron_line(line: str, markers: set[str]) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def candidate_markers(candidates: list[Candidate]) -> tuple[set[str], set[str]]:
+    markers: set[str] = set()
+    users = {"root"}
+    for candidate in candidates:
+        markers.update(cron_matchers_for_candidate(candidate))
+        users.add(candidate.user or "root")
+    return markers, users
+
+
+def scan_user_crontab(user: str, markers: set[str], progress: Progress | None = None) -> tuple[int, list[str]]:
+    read_run = run_command(["crontab", "-l", "-u", user], progress, allow_fail=True, timeout=10)
+    if read_run.returncode != 0:
+        stderr = (read_run.stderr or "").lower()
+        if "no crontab for" in stderr:
+            return 0, []
+        return 0, [f"user crontab read failed for {user}: {(read_run.stderr or read_run.stdout).strip()}"]
+
+    lines = (read_run.stdout or "").splitlines()
+    removed = [line for line in lines if should_remove_cron_line(line, markers)]
+    return len(removed), []
+
+
+def scan_system_cron_file(path: Path, markers: set[str]) -> tuple[int, list[str]]:
+    if not path.exists() or not path.is_file():
+        return 0, []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as err:
+        return 0, [f"failed to read {path}: {err}"]
+    removed = [line for line in lines if should_remove_cron_line(line, markers)]
+    return len(removed), []
+
+
+def scan_cron_references(candidates: list[Candidate], progress: Progress | None = None) -> tuple[int, list[str], list[str]]:
+    markers, users = candidate_markers(candidates)
+    removed_total = 0
+    changed_targets: list[str] = []
+    errors: list[str] = []
+
+    for user in sorted(users):
+        removed, user_errors = scan_user_crontab(user, markers, progress)
+        removed_total += removed
+        if removed > 0:
+            changed_targets.append(f"user:{user}")
+        errors.extend(user_errors)
+
+    for system_path in SYSTEM_CRON_FILES:
+        removed, path_errors = scan_system_cron_file(system_path, markers)
+        removed_total += removed
+        if removed > 0:
+            changed_targets.append(str(system_path))
+        errors.extend(path_errors)
+
+    for cron_dir in SYSTEM_CRON_DIRS:
+        if not cron_dir.is_dir():
+            continue
+        for child in sorted(cron_dir.iterdir()):
+            if not child.is_file():
+                continue
+            removed, path_errors = scan_system_cron_file(child, markers)
+            removed_total += removed
+            if removed > 0:
+                changed_targets.append(str(child))
+            errors.extend(path_errors)
+
+    return removed_total, changed_targets, errors
+
+
 def scrub_user_crontab(user: str, markers: set[str], evidence_dir: Path, progress: Progress) -> tuple[int, list[str]]:
     read_run = run_command(["crontab", "-l", "-u", user], progress, allow_fail=True, timeout=10)
     if read_run.returncode != 0:
@@ -578,11 +646,7 @@ def scrub_system_cron_file(path: Path, markers: set[str], evidence_dir: Path, pr
 
 
 def scrub_cron_references(candidates: list[Candidate], evidence_dir: Path, progress: Progress) -> tuple[int, list[str], list[str]]:
-    markers: set[str] = set()
-    users = {"root"}
-    for candidate in candidates:
-        markers.update(cron_matchers_for_candidate(candidate))
-        users.add(candidate.user or "root")
+    markers, users = candidate_markers(candidates)
 
     removed_total = 0
     changed_targets: list[str] = []
@@ -618,44 +682,7 @@ def scrub_cron_references(candidates: list[Candidate], evidence_dir: Path, progr
 
 
 def cron_references_remaining(candidates: list[Candidate], progress: Progress | None = None) -> int:
-    markers: set[str] = set()
-    users = {"root"}
-    for candidate in candidates:
-        markers.update(cron_matchers_for_candidate(candidate))
-        users.add(candidate.user or "root")
-
-    remaining = 0
-    for user in sorted(users):
-        read_run = run_command(["crontab", "-l", "-u", user], progress, allow_fail=True, timeout=10)
-        if read_run.returncode == 0:
-            remaining += sum(1 for line in (read_run.stdout or "").splitlines() if should_remove_cron_line(line, markers))
-
-    for system_path in SYSTEM_CRON_FILES:
-        if system_path.is_file():
-            try:
-                remaining += sum(
-                    1
-                    for line in system_path.read_text(encoding="utf-8").splitlines()
-                    if should_remove_cron_line(line, markers)
-                )
-            except Exception:
-                pass
-
-    for cron_dir in SYSTEM_CRON_DIRS:
-        if not cron_dir.is_dir():
-            continue
-        for child in cron_dir.iterdir():
-            if not child.is_file():
-                continue
-            try:
-                remaining += sum(
-                    1
-                    for line in child.read_text(encoding="utf-8").splitlines()
-                    if should_remove_cron_line(line, markers)
-                )
-            except Exception:
-                continue
-
+    remaining, _targets, _errors = scan_cron_references(candidates, progress)
     return remaining
 
 
@@ -670,11 +697,60 @@ def refresh_snapshot(progress: Progress) -> list[str]:
     return errors
 
 
+def build_planned_actions(
+    candidates: list[Candidate], cron_removed: int, changed_targets: list[str]
+) -> dict[str, object]:
+    return {
+        "candidate_count": len(candidates),
+        "stop_pids": [candidate.pid for candidate in candidates],
+        "quarantine_paths": [candidate.exe for candidate in candidates],
+        "cron_removed_lines": cron_removed,
+        "cron_changed_targets": changed_targets,
+    }
+
+
+def log_planned_actions(
+    progress: Progress, candidates: list[Candidate], cron_removed: int, changed_targets: list[str]
+) -> None:
+    if not candidates:
+        progress.append("Counterstrike plan: no safe candidates matched.")
+        return
+    for candidate in candidates:
+        progress.append(
+            f"plan: stop pid {candidate.pid} ({candidate.proc}) and quarantine {candidate.exe}"
+        )
+    if cron_removed > 0:
+        progress.append(
+            f"plan: remove {cron_removed} cron line(s) across {len(changed_targets)} target(s)"
+        )
+    else:
+        progress.append("plan: no cron persistence references matched the current targets")
+
+
+def summarize_plan(candidates: list[Candidate], cron_removed: int) -> str:
+    if not candidates:
+        return "No miner-persistence candidates matched."
+    return (
+        f"Would stop {len(candidates)} process(es), quarantine {len(candidates)} executable(s), "
+        f"and scrub {cron_removed} cron line(s)."
+    )
+
+
 def build_summary(status: str, mode: str, candidate_count: int, quarantined_count: int, cron_removed: int) -> str:
     if status == "analysis_only":
-        return f"Analyzed {candidate_count} candidate(s). No changes were made."
+        if candidate_count == 0:
+            return "Analyzed host state. No miner-persistence candidates matched."
+        return (
+            f"Analyzed {candidate_count} candidate(s). "
+            f"Counterstrike would quarantine {candidate_count} executable(s) and scrub {cron_removed} cron line(s)."
+        )
     if status == "dry_run":
-        return f"Dry run matched {candidate_count} candidate(s) and would scrub {cron_removed} cron line(s)."
+        if candidate_count == 0:
+            return "Dry run found no safe miner-persistence candidates."
+        return (
+            f"Dry run matched {candidate_count} candidate(s). "
+            f"Would quarantine {candidate_count} executable(s) and scrub {cron_removed} cron line(s)."
+        )
     if status == "contained":
         return (
             f"Contained {candidate_count} candidate(s), quarantined {quarantined_count} executable(s), "
@@ -760,6 +836,13 @@ def main() -> int:
     quarantined_paths: list[str] = []
     changed_targets: list[str] = []
     cron_removed = 0
+    planned_actions: dict[str, object] = {
+        "candidate_count": 0,
+        "stop_pids": [],
+        "quarantine_paths": [],
+        "cron_removed_lines": 0,
+        "cron_changed_targets": [],
+    }
     status_value = "failed"
     result_payload: dict[str, object] | None = None
 
@@ -787,11 +870,19 @@ def main() -> int:
         if not candidates:
             status_value = "blocked" if args.mode == "execute" else ("dry_run" if args.mode == "dry-run" else "analysis_only")
         elif args.mode == "analyze":
+            cron_removed, changed_targets, scan_errors = scan_cron_references(candidates)
+            errors.extend(scan_errors)
+            planned_actions = build_planned_actions(candidates, cron_removed, changed_targets)
+            log_planned_actions(progress, candidates, cron_removed, changed_targets)
             status_value = "analysis_only"
         elif args.mode == "dry-run":
+            cron_removed, changed_targets, scan_errors = scan_cron_references(candidates)
+            errors.extend(scan_errors)
+            planned_actions = build_planned_actions(candidates, cron_removed, changed_targets)
+            log_planned_actions(progress, candidates, cron_removed, changed_targets)
             status_value = "dry_run"
-            cron_removed = cron_references_remaining(candidates)
         else:
+            planned_actions = build_planned_actions(candidates, 0, [])
             progress.set_phase("neutralize", "Stopping suspicious runtime processes", 3)
             for candidate in candidates:
                 capture_process_evidence(candidate, progress.evidence_dir, progress)
@@ -814,6 +905,7 @@ def main() -> int:
             cron_removed, changed_targets, cron_errors = scrub_cron_references(
                 candidates, progress.evidence_dir, progress
             )
+            planned_actions = build_planned_actions(candidates, cron_removed, changed_targets)
             errors.extend(cron_errors)
             progress.append(f"Removed {cron_removed} matching cron line(s).")
 
@@ -867,6 +959,7 @@ def main() -> int:
             "console_path": str(progress.console_path),
             "evidence_dir": str(progress.evidence_dir),
             "matched_candidates": [candidate.to_dict() for candidate in candidates],
+            "planned_actions": planned_actions,
             "quarantined_paths": quarantined_paths,
             "cron_removed_lines": cron_removed,
             "cron_changed_targets": changed_targets,
@@ -912,6 +1005,7 @@ def main() -> int:
                     "console_path": str(progress.console_path),
                     "evidence_dir": str(progress.evidence_dir),
                     "matched_candidates": [candidate.to_dict() for candidate in candidates],
+                    "planned_actions": planned_actions,
                     "quarantined_paths": quarantined_paths,
                     "cron_removed_lines": cron_removed,
                     "cron_changed_targets": changed_targets,

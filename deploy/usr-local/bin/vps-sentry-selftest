@@ -9,6 +9,7 @@ MAINTENANCE="/usr/local/bin/vps-sentry-maintenance"
 PROJECT_STORAGE="/usr/local/bin/vps-sentry-project-storage"
 GARBAGE_ESTIMATE="/usr/local/bin/vps-sentry-garbage-estimate"
 GARBAGE_RECLAIM="/usr/local/bin/vps-sentry-garbage-reclaim"
+COUNTERSTRIKE="/usr/local/bin/vps-sentry-counterstrike"
 
 STATE_DIR="/var/lib/vps-sentry"
 LAST_JSON="$STATE_DIR/last.json"
@@ -26,6 +27,7 @@ PUBLIC_STATUS_DIR="$STATE_DIR/public"
 PUBLIC_STATUS_FILE="$PUBLIC_STATUS_DIR/status.json"
 PUBLIC_LAST_FILE="$PUBLIC_STATUS_DIR/last.json"
 PUBLIC_DIFF_FILE="$PUBLIC_STATUS_DIR/diff.json"
+SUDOERS_FILE="/etc/sudoers.d/90-vps-sentry-maintenance"
 
 WITH_NETWORK=0
 
@@ -278,6 +280,7 @@ test -x "$NOTIFY" || die "missing or not executable: $NOTIFY"
 test -x "$SERVICE_EVENT" || die "missing or not executable: $SERVICE_EVENT"
 test -x "$MAINTENANCE" || die "missing or not executable: $MAINTENANCE"
 test -x "$PROJECT_STORAGE" || die "missing or not executable: $PROJECT_STORAGE"
+test -x "$COUNTERSTRIKE" || die "missing or not executable: $COUNTERSTRIKE"
 "$SENTRY" --version || true
 
 echo
@@ -335,6 +338,29 @@ echo "== 4b) maintenance token smoke =="
 if "$MAINTENANCE" is-active --scope vps-sentry-selftest.service; then
   die "maintenance scope still active after stop"
 fi
+
+echo
+echo "== 4c) counterstrike wiring smoke =="
+test -f "$SUDOERS_FILE" || die "missing sudoers file: $SUDOERS_FILE"
+grep -Eq 'vps-sentry-counterstrike' "$SUDOERS_FILE" || die "sudoers file does not allow vps-sentry-counterstrike"
+COUNTERSTRIKE_JSON="$("$COUNTERSTRIKE" --mode analyze --json)" || die "counterstrike analyze mode failed"
+python3 - <<'PY' "$COUNTERSTRIKE_JSON"
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("playbook") != "zap-01-miner-persistence-purge":
+    raise SystemExit("unexpected counterstrike playbook")
+if payload.get("status") not in {"analysis_only", "contained", "failed"}:
+    raise SystemExit(f"unexpected counterstrike status: {payload.get('status')!r}")
+planned = payload.get("planned_actions")
+if not isinstance(planned, dict):
+    raise SystemExit("counterstrike result missing planned_actions")
+required = {"candidate_count", "stop_pids", "quarantine_paths", "cron_removed_lines", "cron_changed_targets"}
+missing = sorted(required - planned.keys())
+if missing:
+    raise SystemExit(f"counterstrike planned_actions missing keys: {', '.join(missing)}")
+PY
 
 echo
 echo "== 5) baseline run + attempt to accept clean baseline =="
