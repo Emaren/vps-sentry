@@ -865,7 +865,7 @@ def _useful_unit_label(unit: str, raw_name: str) -> str:
 
     slug = _slugify_label(base)
     raw_slug = _slugify_label(raw_name)
-    if slug in _GENERIC_PROCESS_NAMES or slug == raw_slug:
+    if slug in _GENERIC_PROCESS_NAMES or slug == raw_slug or slug.endswith("-app"):
         return ""
     return base
 
