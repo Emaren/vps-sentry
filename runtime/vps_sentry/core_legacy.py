@@ -44,6 +44,7 @@ LAST_REPORT_FILE = STATE_DIR / "last.json"
 DIFF_FILE = STATE_DIR / "diff.json"
 BASELINE_FILE = STATE_DIR / "baseline.json"
 CONFIG_FILE = Path("/etc/vps-sentry.json")
+PROJECTS_FILE = Path(os.environ.get("VPS_SENTRY_PROJECTS_FILE", "/etc/vps-sentry-projects.json"))
 
 # Create this file to accept the *current* snapshots as the new baseline on the next run.
 ACCEPT_BASELINE_FLAG = STATE_DIR / "ACCEPT_BASELINE_NEXT_RUN"
@@ -622,6 +623,11 @@ def proc_explain(pid: int) -> Dict[str, Any]:
     except Exception:
         out["cmdline"] = ""
 
+    try:
+        out["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+    except Exception:
+        out["cwd"] = ""
+
     unit = ""
     try:
         cg = Path(f"/proc/{pid}/cgroup").read_text(errors="replace")
@@ -633,6 +639,360 @@ def proc_explain(pid: int) -> Dict[str, Any]:
     out["unit"] = unit
 
     return out
+
+
+_GENERIC_PROCESS_NAMES = {
+    "",
+    "app",
+    "bash",
+    "bun",
+    "gunicorn",
+    "next",
+    "next-server",
+    "node",
+    "npm",
+    "process",
+    "python",
+    "python3",
+    "sh",
+    "uvicorn",
+}
+
+
+def _slugify_label(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return text
+
+
+def _safe_process_text(*values: Any) -> str:
+    parts = []
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts).lower()
+
+
+def _dedupe_ints(values: List[Any]) -> List[int]:
+    seen = set()
+    out: List[int] = []
+    for raw in values or []:
+        try:
+            value = int(raw)
+        except Exception:
+            continue
+        if value <= 0 or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    out.sort()
+    return out
+
+
+def _load_project_hints() -> List[Dict[str, Any]]:
+    try:
+        payload = json.loads(PROJECTS_FILE.read_text())
+    except Exception:
+        return []
+
+    projects = payload.get("projects")
+    if not isinstance(projects, list):
+        return []
+
+    hints: List[Dict[str, Any]] = []
+    for raw in projects:
+        if not isinstance(raw, dict):
+            continue
+
+        project_id = _slugify_label(raw.get("id") or raw.get("label") or "")
+        if not project_id:
+            continue
+
+        label = str(raw.get("label") or project_id).strip() or project_id
+        roots: List[str] = []
+        storage = raw.get("storage")
+        if isinstance(storage, dict):
+            roots_raw = storage.get("roots")
+            if isinstance(roots_raw, list):
+                for root in roots_raw:
+                    root_text = str(root or "").strip()
+                    if root_text:
+                        roots.append(root_text.rstrip("/"))
+
+        unit_names: List[str] = []
+        services = raw.get("services")
+        if isinstance(services, list):
+            for service in services:
+                if not isinstance(service, dict):
+                    continue
+                unit = str(service.get("unit") or "").strip()
+                if unit:
+                    unit_names.append(unit.lower())
+                aliases = service.get("aliases")
+                if isinstance(aliases, list):
+                    for alias in aliases:
+                        alias_text = str(alias or "").strip()
+                        if alias_text:
+                            unit_names.append(alias_text.lower())
+
+        hints.append({
+            "id": project_id,
+            "label": label,
+            "roots": roots,
+            "root_names": [_slugify_label(Path(root).name) for root in roots],
+            "units": unit_names,
+        })
+
+    return hints
+
+
+def _match_project_hint(
+    project_hints: List[Dict[str, Any]],
+    *,
+    unit: str,
+    exe: str,
+    cmdline: str,
+    cwd: str,
+    raw_name: str,
+) -> Dict[str, Any]:
+    best: Dict[str, Any] = {}
+    best_score = -1
+    pathish_fields = [cwd, exe, cmdline]
+    haystack = _safe_process_text(unit, exe, cmdline, cwd, raw_name)
+
+    for hint in project_hints:
+        score = 0
+
+        for root in hint.get("roots", []) or []:
+            root_text = str(root or "").strip()
+            if not root_text:
+                continue
+            for field in pathish_fields:
+                if not field:
+                    continue
+                if field == root_text or field.startswith(root_text + "/") or root_text in field:
+                    score = max(score, 200 + len(root_text))
+
+        units = hint.get("units", []) or []
+        if unit and unit.lower() in units:
+            score = max(score, 180 + len(unit))
+
+        project_id = str(hint.get("id") or "")
+        if len(project_id) >= 4 and re.search(rf"(?<![a-z0-9]){re.escape(project_id)}(?![a-z0-9])", haystack):
+            score = max(score, 120 + len(project_id))
+
+        for root_name in hint.get("root_names", []) or []:
+            if len(root_name) < 4:
+                continue
+            if re.search(rf"(?<![a-z0-9]){re.escape(root_name)}(?![a-z0-9])", haystack):
+                score = max(score, 110 + len(root_name))
+
+        if score > best_score:
+            best_score = score
+            best = hint
+
+    return best if best_score > 0 else {}
+
+
+def _clean_unit_base(unit: str) -> str:
+    text = str(unit or "").strip()
+    if text.endswith(".service"):
+        text = text[:-8]
+    if "@" in text:
+        text = text.split("@", 1)[0]
+    return text.replace("_", "-")
+
+
+def _infer_service_kind(raw_name: str, unit: str, exe: str, cmdline: str, ports: List[int]) -> str:
+    unit_base = _clean_unit_base(unit).lower()
+    text = _safe_process_text(raw_name, unit_base, exe, cmdline)
+
+    if "chat-api" in unit_base or re.search(r"\bchat[-_ ]api\b", text):
+        return "chat-api"
+    if "ops-worker" in unit_base or re.search(r"\bops[-_ ]worker\b", text):
+        return "ops-worker"
+    if "worker" in unit_base or re.search(r"\b(worker|celery|queue)\b", text):
+        return "worker"
+    if "landing" in unit_base:
+        return "landing"
+    if "indexer" in unit_base or re.search(r"\bindexer\b", text):
+        return "indexer"
+    if re.search(r"\btokenchaind\b", text):
+        return "node"
+    if re.search(r"\b(next-server|next)\b", text) or "/.next/" in text or ".next/" in text:
+        return "web"
+    if re.search(r"\b(uvicorn|gunicorn|fastapi|flask|hypercorn|daphne)\b", text):
+        return "api"
+    if "api" in unit_base:
+        return "api"
+    if "web" in unit_base:
+        return "web"
+
+    for port in ports:
+        if port == 26656:
+            return "node"
+        if 3300 <= port <= 3499:
+            return "api"
+        if 3000 <= port <= 3199:
+            return "web"
+
+    return ""
+
+
+def _infer_tech_label(raw_name: str, unit: str, exe: str, cmdline: str, service_kind: str) -> str:
+    text = _safe_process_text(raw_name, unit, exe, cmdline)
+    if "qemu-ga" in text or "qemu guest agent" in text:
+        return "QEMU guest agent"
+    if re.search(r"\btokenchaind\b", text):
+        return "TokenChain node"
+    if re.search(r"\b(next-server|next)\b", text) or "/.next/" in text or ".next/" in text:
+        return "Next.js app"
+    if re.search(r"\buvicorn\b", text):
+        return "Uvicorn app"
+    if re.search(r"\b(gunicorn|fastapi|flask|hypercorn|daphne)\b", text):
+        return "Python API"
+    if service_kind == "worker":
+        return "Worker service"
+    if service_kind == "ops-worker":
+        return "Ops worker"
+    return ""
+
+
+def _useful_unit_label(unit: str, raw_name: str) -> str:
+    base = _clean_unit_base(unit)
+    if not base:
+        return ""
+
+    slug = _slugify_label(base)
+    raw_slug = _slugify_label(raw_name)
+    if slug in _GENERIC_PROCESS_NAMES or slug == raw_slug:
+        return ""
+    return base
+
+
+def _format_ports_suffix(ports: List[int]) -> str:
+    if not ports:
+        return ""
+    if len(ports) == 1:
+        return f" :{ports[0]}"
+    if len(ports) == 2:
+        return f" :{ports[0]}, :{ports[1]}"
+    return f" :{ports[0]} +{len(ports) - 1}"
+
+
+def _friendly_base_for_project(project_hint: Dict[str, Any], service_kind: str) -> str:
+    project_id = str(project_hint.get("id") or "")
+    project_label = str(project_hint.get("label") or project_id).strip() or project_id
+
+    if service_kind in ("api", "chat-api", "indexer", "landing", "ops-worker", "web", "worker"):
+        return f"{project_id}-{service_kind}"
+    if service_kind == "node":
+        return f"{project_label} node"
+    return project_id or project_label
+
+
+def resolve_process_enrichment(
+    *,
+    raw_name: str,
+    unit: str,
+    exe: str,
+    cmdline: str,
+    cwd: str,
+    ports: List[int],
+    project_hints: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    matched_project = _match_project_hint(
+        project_hints,
+        unit=unit,
+        exe=exe,
+        cmdline=cmdline,
+        cwd=cwd,
+        raw_name=raw_name,
+    )
+    project_id = str(matched_project.get("id") or "")
+    project_label = str(matched_project.get("label") or project_id).strip() or project_id
+    service_kind = _infer_service_kind(raw_name, unit, exe, cmdline, ports)
+    explicit_unit = _useful_unit_label(unit, raw_name)
+    tech_label = _infer_tech_label(raw_name, unit, exe, cmdline, service_kind)
+
+    if tech_label in ("QEMU guest agent", "TokenChain node"):
+        base_label = tech_label
+    elif explicit_unit:
+        base_label = explicit_unit
+    elif matched_project and service_kind:
+        base_label = _friendly_base_for_project(matched_project, service_kind)
+    elif matched_project:
+        base_label = project_id or project_label
+    elif tech_label:
+        base_label = tech_label
+    else:
+        base_label = str(raw_name or "process").strip() or "process"
+
+    if ports and service_kind not in ("guest-agent", "node") and base_label not in ("QEMU guest agent", "TokenChain node"):
+        label = f"{base_label}{_format_ports_suffix(ports)}"
+    else:
+        label = base_label
+
+    return {
+        "label": label,
+        "project": project_id,
+        "project_label": project_label,
+        "service_kind": service_kind,
+        "tech": tech_label,
+        "ports": ports,
+    }
+
+
+def enrich_vitals_process_rows(rows: List[Dict[str, Any]], listening_ports: Any = None) -> None:
+    if not rows:
+        return
+
+    ports_by_pid: Dict[int, List[int]] = {}
+    for port_row in listening_ports or []:
+        try:
+            pid = int(port_row.get("pid", 0) or 0)
+            port = int(port_row.get("port", 0) or 0)
+        except Exception:
+            continue
+        if pid <= 0 or port <= 0:
+            continue
+        ports_by_pid.setdefault(pid, []).append(port)
+
+    project_hints = _load_project_hints()
+
+    for row in rows:
+        pid = int(row.get("pid", 0) or 0)
+        if pid <= 0:
+            continue
+
+        raw_name = str(row.get("name", "") or "process")
+        explained = proc_explain(pid)
+        exe = str(explained.get("exe", "") or "")
+        cmdline = str(explained.get("cmdline", "") or "")
+        cwd = str(explained.get("cwd", "") or "")
+        unit = str(explained.get("unit", "") or "")
+        ports = _dedupe_ints(ports_by_pid.get(pid, []))
+
+        enrichment = resolve_process_enrichment(
+            raw_name=raw_name,
+            unit=unit,
+            exe=exe,
+            cmdline=cmdline,
+            cwd=cwd,
+            ports=ports,
+            project_hints=project_hints,
+        )
+
+        row["label"] = str(enrichment.get("label", "") or raw_name)
+        row["ports"] = ports
+        row["unit"] = unit
+        row["exe"] = exe
+        row["cmdline"] = clamp(cmdline, 320)
+        row["cwd"] = cwd
+        row["project"] = str(enrichment.get("project", "") or "")
+        row["project_label"] = str(enrichment.get("project_label", "") or "")
+        row["service_kind"] = str(enrichment.get("service_kind", "") or "")
+        row["tech"] = str(enrichment.get("tech", "") or "")
 
 
 # ---------------------------
@@ -801,7 +1161,7 @@ def memory_snapshot() -> Dict[str, Any]:
     }
 
 
-def collect_resource_vitals(top_n: int = 5) -> Dict[str, Any]:
+def collect_resource_vitals(top_n: int = 5, listening_ports: Any = None) -> Dict[str, Any]:
     cores = int(os.cpu_count() or 1)
     cores = max(1, cores)
 
@@ -880,6 +1240,7 @@ def collect_resource_vitals(top_n: int = 5) -> Dict[str, Any]:
     other_rows = ordered[top_n:]
 
     top_payload = [_to_proc_payload(r) for r in top_rows]
+    enrich_vitals_process_rows(top_payload, listening_ports=listening_ports)
 
     other_payload = None
     if other_rows:
@@ -1812,7 +2173,10 @@ def main():
         "persistence_hits": [],
         "indicators": threat_indicators,
     }
-    vitals_payload = collect_resource_vitals(top_n=int(cfg.get("vitals_top_processes", 5)))
+    vitals_payload = collect_resource_vitals(
+        top_n=int(cfg.get("vitals_top_processes", 5)),
+        listening_ports=all_ports,
+    )
 
     if bool(cfg.get("enable_cpu_hotspot_alert", True)):
         try:
