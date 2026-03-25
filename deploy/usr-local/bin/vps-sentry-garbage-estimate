@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,9 @@ VSIX_MIN_AGE_HOURS = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_VSIX_MIN_AGE_
 PACKAGE_CACHE_MIN_BYTES = max(
     0, int(os.environ.get("VPS_SENTRY_GARBAGE_PACKAGE_CACHE_MIN_BYTES", str(50 * 1024 * 1024)))
 )
+NEXT_CACHE_MIN_BYTES = max(
+    0, int(os.environ.get("VPS_SENTRY_GARBAGE_NEXT_CACHE_MIN_BYTES", str(25 * 1024 * 1024)))
+)
 APT_CACHE_MIN_BYTES = max(
     0, int(os.environ.get("VPS_SENTRY_GARBAGE_APT_CACHE_MIN_BYTES", str(50 * 1024 * 1024)))
 )
@@ -33,7 +37,53 @@ JOURNAL_TARGET_BYTES = max(
 BACKUP_KEEP = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP", "5")))
 TOP_PATHS_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_TOP_PATHS_LIMIT", "8")))
 PROGRESS_RECENT_LINES_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_PROGRESS_LINES", "6")))
-SCHEMA_VERSION = 1
+PROJECTS_JSON = Path(os.environ.get("VPS_SENTRY_PROJECTS_JSON", "/etc/vps-sentry-projects.json"))
+HOST_PROJECT_ID = os.environ.get("VPS_SENTRY_GARBAGE_HOST_PROJECT_ID", "vps-host")
+SCHEMA_VERSION = 2
+
+CATEGORY_META = {
+    "garbage": {
+        "label": "Garbage Dump",
+        "description": "Dead-weight junk that is usually safe to delete outright.",
+    },
+    "recycling": {
+        "label": "Recycling Center",
+        "description": "Caches and rebuildable artifacts that can be regenerated later.",
+    },
+    "guided": {
+        "label": "Guided Reclaim",
+        "description": "Bigger wins that should be reviewed before execution.",
+    },
+    "blocked": {
+        "label": "Blocked / Manual",
+        "description": "Candidates that need manual review or extra access before cleanup.",
+    },
+}
+
+RISK_META = {
+    "safe": {"label": "Safe now"},
+    "guided": {"label": "Guided"},
+    "dangerous": {"label": "Dangerous"},
+    "blocked": {"label": "Blocked"},
+}
+
+PROFILE_META = {
+    "safe": {
+        "label": "safe reclaim",
+        "scan_label": "Scanning safe reclaim candidates",
+        "empty_label": "no safe reclaim candidates matched",
+    },
+    "garbage": {
+        "label": "garbage-only reclaim",
+        "scan_label": "Scanning Garbage Dump candidates",
+        "empty_label": "no safe garbage candidates matched",
+    },
+    "recycling": {
+        "label": "recycling-only reclaim",
+        "scan_label": "Scanning Recycling Center candidates",
+        "empty_label": "no safe recycling candidates matched",
+    },
+}
 
 TMP_NAME_PREFIXES = (
     "tmp.",
@@ -57,6 +107,8 @@ PACKAGE_CACHE_SUFFIXES = (
     ".cache/pip",
     ".local/share/pnpm/store",
 )
+
+PROJECT_REGISTRY_CACHE: list[dict[str, object]] | None = None
 
 
 def log(message: str) -> None:
@@ -140,6 +192,114 @@ def load_json(path: Path) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def normalize_path_text(path: Path | str) -> str:
+    path_obj = path if isinstance(path, Path) else Path(path)
+    try:
+        if path_obj.exists():
+            return str(path_obj.resolve())
+    except OSError:
+        pass
+    return str(path_obj)
+
+
+def load_project_registry() -> list[dict[str, object]]:
+    global PROJECT_REGISTRY_CACHE
+    if PROJECT_REGISTRY_CACHE is not None:
+        return PROJECT_REGISTRY_CACHE
+
+    payload = load_json(PROJECTS_JSON) or {}
+    rows = payload.get("projects")
+    if not isinstance(rows, list):
+        PROJECT_REGISTRY_CACHE = []
+        return PROJECT_REGISTRY_CACHE
+
+    projects: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        storage = row.get("storage")
+        storage_roots: list[str] = []
+        if isinstance(storage, dict):
+            roots = storage.get("roots")
+            if isinstance(roots, list):
+                for raw_root in roots:
+                    if isinstance(raw_root, str) and raw_root.strip():
+                        storage_roots.append(normalize_path_text(raw_root.strip()))
+
+        services_raw = row.get("services")
+        service_refs: list[str] = []
+        if isinstance(services_raw, list):
+            for service in services_raw:
+                if not isinstance(service, dict):
+                    continue
+                unit = service.get("unit")
+                if isinstance(unit, str) and unit.strip():
+                    service_refs.append(unit.strip())
+
+        projects.append(
+            {
+                "id": str(row.get("id") or "").strip(),
+                "label": str(row.get("label") or "").strip(),
+                "public_url": str(row.get("public_url") or "").strip(),
+                "storage_roots": storage_roots,
+                "service_refs": service_refs,
+            }
+        )
+
+    PROJECT_REGISTRY_CACHE = projects
+    return projects
+
+
+def fallback_host_project() -> dict[str, object] | None:
+    for project in load_project_registry():
+        if str(project.get("id") or "") == HOST_PROJECT_ID:
+            return project
+    return None
+
+
+def project_context_for_path(path: Path | str) -> dict[str, object] | None:
+    path_text = normalize_path_text(path)
+    best_match: dict[str, object] | None = None
+    best_match_len = -1
+
+    for project in load_project_registry():
+        for root in project.get("storage_roots", []):
+            if not isinstance(root, str) or not root:
+                continue
+            if path_text == root or path_text.startswith(f"{root}/"):
+                if len(root) > best_match_len:
+                    best_match = project
+                    best_match_len = len(root)
+
+    target = best_match
+    if target is None:
+        host_project = fallback_host_project()
+        if host_project and (
+            path_text == "/tmp"
+            or path_text.startswith("/tmp/")
+            or path_text == "/var/tmp"
+            or path_text.startswith("/var/tmp/")
+            or path_text == "/var/log"
+            or path_text.startswith("/var/log/")
+            or path_text == "/var/cache"
+            or path_text.startswith("/var/cache/")
+            or "/.vscode-server/" in path_text
+        ):
+            target = host_project
+
+    if target is None:
+        return None
+
+    out = {
+        "project_id": str(target.get("id") or "").strip() or None,
+        "project_label": str(target.get("label") or "").strip() or None,
+        "project_url": str(target.get("public_url") or "").strip() or None,
+        "service_refs": [ref for ref in target.get("service_refs", []) if isinstance(ref, str) and ref.strip()],
+    }
+    return out
 
 
 def write_json(path: Path, payload: dict[str, object], mode: int = 0o600) -> None:
@@ -271,6 +431,20 @@ def journal_disk_usage_bytes() -> int | None:
     return int(amount * scale)
 
 
+def execute_command_for(action: str, path_text: str) -> str:
+    if action == "remove_path":
+        return f"rm -rf {shlex.quote(path_text)}"
+    if action == "apt_clean":
+        return "apt-get clean"
+    if action == "journal_vacuum":
+        return f"journalctl --vacuum-size={JOURNAL_TARGET_BYTES}"
+    return action or "cleanup"
+
+
+def preview_command_for(path_text: str) -> str:
+    return f"du -sh {shlex.quote(path_text)}"
+
+
 def candidate(
     *,
     key: str,
@@ -279,11 +453,18 @@ def candidate(
     bytes_value: int,
     action: str,
     kind: str,
+    category: str,
+    risk: str = "safe",
+    explanation: str | None = None,
+    regrows: bool = False,
+    requires_stop: bool = False,
 ) -> dict[str, object]:
     path_obj = Path(path) if not isinstance(path, Path) else path
     path_text = str(path_obj)
     candidate_id = f"{action}:{path_obj.resolve() if path_obj.exists() else path_text}"
-    return {
+    project_context = project_context_for_path(path_obj)
+    execute_command = execute_command_for(action, path_text)
+    payload = {
         "id": candidate_id,
         "key": key,
         "label": label,
@@ -291,7 +472,19 @@ def candidate(
         "bytes": max(0, int(bytes_value)),
         "action": action,
         "kind": kind,
+        "category": category,
+        "category_label": CATEGORY_META.get(category, {}).get("label", category.title()),
+        "risk": risk,
+        "risk_label": RISK_META.get(risk, {}).get("label", risk.title()),
+        "requires_stop": requires_stop,
+        "regrows": regrows,
+        "explanation": explanation or "",
+        "preview_command": preview_command_for(path_text),
+        "execute_command": execute_command,
     }
+    if project_context:
+        payload.update(project_context)
+    return payload
 
 
 def dedupe_candidates(items: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -329,26 +522,50 @@ def scan_tmp_candidates() -> list[dict[str, object]]:
                     bytes_value=bytes_value,
                     action="remove_path",
                     kind="path",
+                    category="garbage",
+                    explanation=f"Temporary scratch files older than {TMP_MIN_AGE_HOURS}h.",
                 )
             )
     return out
 
 
-def scan_next_oldpacks() -> list[dict[str, object]]:
-    min_age_seconds = NEXT_OLDPACK_MIN_AGE_HOURS * 3600
+def find_paths(root: Path, pattern: str, path_type: str) -> list[Path]:
+    try:
+        completed = subprocess.run(
+            ["find", str(root), "-xdev", "-type", path_type, "-path", pattern, "-print"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+
+    out: list[Path] = []
+    for line in completed.stdout.splitlines():
+        raw = line.strip()
+        if raw:
+            out.append(Path(raw))
+    return out
+
+
+def scan_next_cache_dirs() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for root in scan_roots():
-        for size, mtime_epoch, path in find_matches(root, "*/.next/cache/webpack/*/index.pack.old"):
-            if datetime.now(timezone.utc).timestamp() - mtime_epoch < min_age_seconds:
+        for path in find_paths(root, "*/.next/cache", "d"):
+            bytes_value = path_disk_bytes(path)
+            if bytes_value < NEXT_CACHE_MIN_BYTES:
                 continue
             out.append(
                 candidate(
-                    key="next_oldpacks",
-                    label="Dead Next.js old cache packs",
+                    key="next_cache",
+                    label="Next.js build caches",
                     path=path,
-                    bytes_value=size,
+                    bytes_value=bytes_value,
                     action="remove_path",
                     kind="path",
+                    category="recycling",
+                    explanation="Build cache data that will regenerate on the next install/build.",
+                    regrows=True,
                 )
             )
     return out
@@ -376,6 +593,9 @@ def scan_vscode_old_bins() -> list[dict[str, object]]:
                     bytes_value=bytes_value,
                     action="remove_path",
                     kind="path",
+                    category="recycling",
+                    explanation="Older VS Code remote-server builds that can be reinstalled if needed.",
+                    regrows=True,
                 )
             )
     return out
@@ -418,6 +638,9 @@ def scan_vscode_old_extensions() -> list[dict[str, object]]:
                         bytes_value=bytes_value,
                         action="remove_path",
                         kind="path",
+                        category="recycling",
+                        explanation="Superseded VS Code extensions; latest version remains installed.",
+                        regrows=True,
                     )
                 )
     return out
@@ -444,6 +667,9 @@ def scan_vsix_cache() -> list[dict[str, object]]:
                     bytes_value=bytes_value,
                     action="remove_path",
                     kind="path",
+                    category="recycling",
+                    explanation=f"Cached extension downloads older than {VSIX_MIN_AGE_HOURS}h.",
+                    regrows=True,
                 )
             )
     return out
@@ -467,6 +693,9 @@ def scan_package_caches() -> list[dict[str, object]]:
                     bytes_value=bytes_value,
                     action="remove_path",
                     kind="path",
+                    category="recycling",
+                    explanation="Package caches can be re-downloaded when the tool needs them again.",
+                    regrows=True,
                 )
             )
     return out
@@ -487,6 +716,9 @@ def scan_apt_cache() -> list[dict[str, object]]:
             bytes_value=bytes_value,
             action="apt_clean",
             kind="command",
+            category="recycling",
+            explanation="APT archives can be re-fetched from package repositories.",
+            regrows=True,
         )
     ]
 
@@ -503,6 +735,9 @@ def scan_journal_excess() -> list[dict[str, object]]:
             bytes_value=max(0, usage - JOURNAL_TARGET_BYTES),
             action="journal_vacuum",
             kind="command",
+            category="garbage",
+            explanation="Rotated journal history above the configured cap.",
+            regrows=True,
         )
     ]
 
@@ -531,6 +766,8 @@ def scan_backup_retention() -> list[dict[str, object]]:
                     bytes_value=bytes_value,
                     action="remove_path",
                     kind="path",
+                    category="garbage",
+                    explanation=f"Backup archive older than the keep window ({BACKUP_KEEP} newest kept).",
                 )
             )
     return out
@@ -539,7 +776,7 @@ def scan_backup_retention() -> list[dict[str, object]]:
 def collect_candidates() -> list[dict[str, object]]:
     return dedupe_candidates(
         scan_tmp_candidates()
-        + scan_next_oldpacks()
+        + scan_next_cache_dirs()
         + scan_vscode_old_bins()
         + scan_vscode_old_extensions()
         + scan_vsix_cache()
@@ -550,17 +787,29 @@ def collect_candidates() -> list[dict[str, object]]:
     )
 
 
+def safe_candidates_for_profile(candidates: list[dict[str, object]], profile: str) -> list[dict[str, object]]:
+    safe = [item for item in candidates if str(item.get("risk") or "safe") == "safe"]
+    if profile in {"garbage", "recycling"}:
+        return [item for item in safe if str(item.get("category") or "") == profile]
+    return safe
+
+
 def summarize_candidates(
     candidates: list[dict[str, object]], last_cleanup_result: dict[str, object] | None
 ) -> dict[str, object]:
     measured_at = iso_utc_now()
     buckets: dict[str, dict[str, object]] = {}
+    categories: dict[str, dict[str, object]] = {}
+    risks: dict[str, dict[str, object]] = {}
     top_paths: list[dict[str, object]] = []
+    candidate_rows: list[dict[str, object]] = []
 
     for item in candidates:
         key = str(item["key"])
         label = str(item["label"])
         bytes_value = int(item["bytes"])
+        category = str(item.get("category") or "garbage")
+        risk = str(item.get("risk") or "safe")
         bucket = buckets.setdefault(
             key,
             {
@@ -572,6 +821,29 @@ def summarize_candidates(
         )
         bucket["bytes"] = int(bucket["bytes"]) + bytes_value
         bucket["count"] = int(bucket["count"]) + 1
+        category_row = categories.setdefault(
+            category,
+            {
+                "key": category,
+                "label": CATEGORY_META.get(category, {}).get("label", category.title()),
+                "description": CATEGORY_META.get(category, {}).get("description", ""),
+                "bytes": 0,
+                "count": 0,
+            },
+        )
+        category_row["bytes"] = int(category_row["bytes"]) + bytes_value
+        category_row["count"] = int(category_row["count"]) + 1
+        risk_row = risks.setdefault(
+            risk,
+            {
+                "key": risk,
+                "label": RISK_META.get(risk, {}).get("label", risk.title()),
+                "bytes": 0,
+                "count": 0,
+            },
+        )
+        risk_row["bytes"] = int(risk_row["bytes"]) + bytes_value
+        risk_row["count"] = int(risk_row["count"]) + 1
         top_paths.append(
             {
                 "path": str(item["path"]),
@@ -579,21 +851,45 @@ def summarize_candidates(
                 "bucket": key,
             }
         )
+        candidate_rows.append(item)
 
     bucket_rows = sorted(
         buckets.values(),
         key=lambda row: (-int(row["bytes"]), str(row["label"])),
     )
+    category_rows = sorted(
+        categories.values(),
+        key=lambda row: (-int(row["bytes"]), str(row["label"])),
+    )
+    risk_rows = sorted(
+        risks.values(),
+        key=lambda row: (-int(row["bytes"]), str(row["label"])),
+    )
     top_paths.sort(key=lambda row: (-int(row["bytes"]), str(row["path"])))
+    candidate_rows.sort(key=lambda row: (-int(row["bytes"]), str(row["label"]), str(row["path"])))
 
     reclaimable_bytes_total = sum(int(item["bytes"]) for item in candidates)
+    safe_reclaimable_bytes = sum(int(item["bytes"]) for item in candidates if str(item.get("risk") or "safe") == "safe")
+    garbage_reclaimable_bytes = sum(int(item["bytes"]) for item in candidates if str(item.get("category") or "") == "garbage")
+    rebuildable_bytes = sum(int(item["bytes"]) for item in candidates if str(item.get("category") or "") == "recycling")
+    guided_reclaimable_bytes = sum(int(item["bytes"]) for item in candidates if str(item.get("risk") or "") == "guided")
+    blocked_reclaimable_bytes = sum(
+        int(item["bytes"]) for item in candidates if str(item.get("risk") or "") in {"dangerous", "blocked"}
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
         "measured_at": measured_at,
         "ttl_seconds": TTL_SECONDS,
         "reclaimable_bytes_total": reclaimable_bytes_total,
-        "safe_reclaimable_bytes": reclaimable_bytes_total,
+        "safe_reclaimable_bytes": safe_reclaimable_bytes,
+        "garbage_reclaimable_bytes": garbage_reclaimable_bytes,
+        "rebuildable_bytes": rebuildable_bytes,
+        "guided_reclaimable_bytes": guided_reclaimable_bytes,
+        "blocked_reclaimable_bytes": blocked_reclaimable_bytes,
+        "category_totals": category_rows,
+        "risk_totals": risk_rows,
+        "candidates": candidate_rows,
         "buckets": bucket_rows,
         "top_paths": top_paths[:TOP_PATHS_LIMIT],
         "running_cleanup": RUNNING_JSON.exists(),
@@ -686,9 +982,10 @@ def apply_candidate(item: dict[str, object]) -> tuple[bool, str]:
     return False, f"unsupported action: {action}"
 
 
-def cleanup_result_for_error(message: str) -> dict[str, object]:
+def cleanup_result_for_error(message: str, profile: str = "safe") -> dict[str, object]:
     return {
         "ok": False,
+        "profile": profile,
         "started_at": iso_utc_now(),
         "finished_at": iso_utc_now(),
         "freed_bytes_estimated": 0,
@@ -707,13 +1004,7 @@ def trim_recent_lines(lines: list[str]) -> list[str]:
 def command_preview(item: dict[str, object]) -> str:
     action = str(item.get("action") or "").strip()
     path = str(item.get("path") or "").strip()
-    if action == "remove_path":
-        return f"rm -rf {path}"
-    if action == "apt_clean":
-        return "apt-get clean"
-    if action == "journal_vacuum":
-        return f"journalctl --vacuum-size={JOURNAL_TARGET_BYTES}"
-    return action or "cleanup"
+    return execute_command_for(action, path)
 
 
 def estimate_eta_seconds(started_at: str, completed_steps: int | None, total_steps: int | None) -> int | None:
@@ -779,6 +1070,13 @@ def running_snapshot(
     snapshot.setdefault("ttl_seconds", TTL_SECONDS)
     snapshot.setdefault("reclaimable_bytes_total", 0)
     snapshot.setdefault("safe_reclaimable_bytes", 0)
+    snapshot.setdefault("garbage_reclaimable_bytes", 0)
+    snapshot.setdefault("rebuildable_bytes", 0)
+    snapshot.setdefault("guided_reclaimable_bytes", 0)
+    snapshot.setdefault("blocked_reclaimable_bytes", 0)
+    snapshot.setdefault("category_totals", [])
+    snapshot.setdefault("risk_totals", [])
+    snapshot.setdefault("candidates", [])
     snapshot.setdefault("buckets", [])
     snapshot.setdefault("top_paths", [])
     snapshot["running_cleanup"] = True
@@ -787,16 +1085,17 @@ def running_snapshot(
     return snapshot
 
 
-def run_reclaim() -> tuple[int, dict[str, object]]:
+def run_reclaim(profile: str) -> tuple[int, dict[str, object]]:
     started_at = iso_utc_now()
-    recent_lines = ["$ scan safe garbage candidates"]
+    profile_meta = PROFILE_META.get(profile, PROFILE_META["safe"])
+    recent_lines = [f"$ scan {profile_meta['label']} candidates"]
     write_running_progress(
         build_running_progress(
             started_at=started_at,
             phase="scanning",
-            current_label="Scanning safe cleanup candidates",
+            current_label=str(profile_meta["scan_label"]),
             current_target=None,
-            current_command="scan safe garbage candidates",
+            current_command=f"scan {profile_meta['label']} candidates",
             completed_steps=0,
             total_steps=None,
             errors_count=0,
@@ -807,7 +1106,8 @@ def run_reclaim() -> tuple[int, dict[str, object]]:
     )
 
     before_available = measure_disk_available_bytes("/")
-    candidates = collect_candidates()
+    all_candidates = collect_candidates()
+    candidates = safe_candidates_for_profile(all_candidates, profile)
     total_steps = len(candidates) + 1
     bucket_rows: dict[str, dict[str, object]] = {}
     errors: list[str] = []
@@ -816,7 +1116,7 @@ def run_reclaim() -> tuple[int, dict[str, object]]:
     processed_steps = 0
 
     if not candidates:
-        recent_lines.append("no safe garbage matched")
+        recent_lines.append(str(profile_meta["empty_label"]))
 
     for item in candidates:
         key = str(item["key"])
@@ -885,6 +1185,7 @@ def run_reclaim() -> tuple[int, dict[str, object]]:
 
     result = {
         "ok": len(errors) == 0,
+        "profile": profile,
         "started_at": started_at,
         "finished_at": finished_at,
         "freed_bytes_estimated": freed_bytes_estimated,
@@ -921,6 +1222,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="Ignore cache TTL and rescan now.")
     parser.add_argument("--json", action="store_true", help="Print resulting JSON payload to stdout.")
     parser.add_argument("--reclaim", action="store_true", help="Delete matched safe garbage and refresh the estimate.")
+    parser.add_argument(
+        "--profile",
+        choices=sorted(PROFILE_META.keys()),
+        default="safe",
+        help="Restrict reclaim to all safe candidates, only Garbage Dump, or only Recycling Center.",
+    )
     return parser.parse_args()
 
 
@@ -930,7 +1237,7 @@ def main() -> int:
     try:
         lock_handle = acquire_lock(nonblocking=args.reclaim)
     except BlockingIOError:
-        payload = cleanup_result_for_error("garbage cleanup already running")
+        payload = cleanup_result_for_error("garbage cleanup already running", profile=args.profile)
         if args.json:
             json.dump(payload, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
@@ -940,7 +1247,7 @@ def main() -> int:
 
     with lock_handle:
         if args.reclaim:
-            status, payload = run_reclaim()
+            status, payload = run_reclaim(args.profile)
         else:
             payload = estimate_snapshot(force=args.force)
             merge_into_last(payload)
