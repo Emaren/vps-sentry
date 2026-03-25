@@ -149,6 +149,27 @@
       }
     },
     {
+      "id": "traffic",
+      "label": "Traffic",
+      "public_url": "https://traffic.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/Traffic"
+        ]
+      }
+    },
+    {
+      "id": "wallyverse",
+      "label": "Wallyverse",
+      "public_url": "https://wallyverse.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/home/tony/projects/wallyverse-web",
+          "/home/tony/projects/wallyverse-api"
+        ]
+      }
+    },
+    {
       "id": "vps-host",
       "label": "VPS Host",
       "services": [
