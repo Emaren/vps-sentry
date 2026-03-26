@@ -362,6 +362,25 @@ if missing:
     raise SystemExit(f"counterstrike planned_actions missing keys: {', '.join(missing)}")
 PY
 
+COUNTERSTRIKE_ZAP2_JSON="$("$COUNTERSTRIKE" --playbook zap-02-busybox-loader-cutoff --mode analyze --json)" || die "counterstrike zap-02 analyze mode failed"
+python3 - <<'PY' "$COUNTERSTRIKE_ZAP2_JSON"
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("playbook") != "zap-02-busybox-loader-cutoff":
+    raise SystemExit("unexpected counterstrike zap-02 playbook")
+if payload.get("status") not in {"analysis_only", "contained", "failed"}:
+    raise SystemExit(f"unexpected zap-02 counterstrike status: {payload.get('status')!r}")
+planned = payload.get("planned_actions")
+if not isinstance(planned, dict):
+    raise SystemExit("counterstrike zap-02 result missing planned_actions")
+required = {"candidate_count", "stop_pids", "quarantine_paths", "cron_removed_lines", "cron_changed_targets", "container_remove_names"}
+missing = sorted(required - planned.keys())
+if missing:
+    raise SystemExit(f"counterstrike zap-02 planned_actions missing keys: {', '.join(missing)}")
+PY
+
 echo
 echo "== 5) baseline run + attempt to accept clean baseline =="
 systemctl start vps-sentry.service

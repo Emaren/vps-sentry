@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -63,12 +65,37 @@ PHASE_ETAS = {
     "record": 4,
 }
 
-PLAYBOOK = {
-    "id": "zap-01-miner-persistence-purge",
-    "label": "Zap! #1",
-    "title": "Miner Persistence Purge",
-    "description": "Kill suspicious miner-style processes in writable paths, quarantine binaries, and scrub matching cron persistence.",
+PLAYBOOKS = {
+    "zap-01-miner-persistence-purge": {
+        "id": "zap-01-miner-persistence-purge",
+        "label": "Zap! #1",
+        "title": "Miner Persistence Purge",
+        "description": "Kill suspicious miner-style processes in writable paths, quarantine binaries, and scrub matching cron persistence.",
+    },
+    "zap-02-busybox-loader-cutoff": {
+        "id": "zap-02-busybox-loader-cutoff",
+        "label": "Zap! #2",
+        "title": "BusyBox Loader Cutoff",
+        "description": "Cut containerized BusyBox or shell loader loops, preserve decoded payload evidence, and remove the restartable rogue container when it matches the IOC profile.",
+    },
 }
+DEFAULT_PLAYBOOK = PLAYBOOKS["zap-01-miner-persistence-purge"]
+SYSTEM_EXECUTABLE_PREFIXES = ("/bin/", "/usr/bin/", "/usr/local/bin/", "/sbin/", "/usr/sbin/")
+CONTAINER_SCOPE_PATTERNS = (
+    re.compile(r"docker-([0-9a-f]{12,64})\.scope"),
+    re.compile(r"/docker/([0-9a-f]{12,64})(?:/|$)"),
+)
+CONTAINER_IOC_TOKENS = (
+    "base64 -d>/tmp/",
+    "sleep 3600",
+    "siti.loader.id",
+    "autoload",
+    "busybox wget",
+    "curl -sk",
+    "wget -qo-",
+    "nsenter -t 1",
+)
+CONTAINER_BIND_ALERTS = ("/", "/var/run/docker.sock")
 
 
 def iso_utc_now() -> str:
@@ -130,6 +157,10 @@ def as_int(value: object) -> int:
     return 0
 
 
+def as_bool(value: object) -> bool:
+    return value is True
+
+
 def sanitize_slug(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()
     return cleaned or "item"
@@ -162,6 +193,32 @@ def is_user_writable_path(path_text: str) -> bool:
     return any(normalized.startswith(prefix) for prefix in USER_WRITABLE_PREFIXES)
 
 
+def is_system_binary_path(path_text: str) -> bool:
+    normalized = os.path.normpath(path_text.strip())
+    if not normalized.startswith("/"):
+        return False
+    return any(normalized.startswith(prefix) for prefix in SYSTEM_EXECUTABLE_PREFIXES)
+
+
+def sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def decode_base64_text(value: str) -> str | None:
+    try:
+        raw = base64.b64decode(value.strip(), validate=False)
+        return raw.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+
+
 def extract_status_source() -> dict[str, object]:
     public = load_json(PUBLIC_STATUS_JSON) or {}
     last = load_json(LAST_STATUS_JSON) or {}
@@ -188,6 +245,15 @@ class Candidate:
     cmdline: str
     reasons: list[str]
     score: int
+    scope: str = "host"
+    container_id: str | None = None
+    container_name: str | None = None
+    container_image: str | None = None
+    container_restart_policy: str | None = None
+    payload_path: str | None = None
+    payload_host_path: str | None = None
+    payload_sha256: str | None = None
+    decoded_payload: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -198,6 +264,15 @@ class Candidate:
             "cmdline": self.cmdline,
             "reasons": self.reasons,
             "score": self.score,
+            "scope": self.scope,
+            "container_id": self.container_id,
+            "container_name": self.container_name,
+            "container_image": self.container_image,
+            "container_restart_policy": self.container_restart_policy,
+            "payload_path": self.payload_path,
+            "payload_host_path": self.payload_host_path,
+            "payload_sha256": self.payload_sha256,
+            "decoded_payload": self.decoded_payload,
         }
 
 
@@ -217,7 +292,95 @@ def candidate_score(proc: str, exe: str, cmdline: str, reasons: list[str]) -> in
     return score
 
 
-def extract_candidates(status: dict[str, object]) -> list[Candidate]:
+def docker_container_id_for_pid(pid: int) -> str | None:
+    path = Path("/proc") / str(pid) / "cgroup"
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    for line in raw.splitlines():
+        for pattern in CONTAINER_SCOPE_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                return match.group(1)
+    return None
+
+
+def docker_inspect(container_id: str) -> dict[str, object] | None:
+    try:
+        completed = subprocess.run(
+            ["docker", "inspect", container_id],
+            capture_output=True,
+            text=True,
+            timeout=min(COMMAND_TIMEOUT_SECONDS, 20),
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout or "[]")
+    except Exception:
+        return None
+    if not isinstance(payload, list) or not payload:
+        return None
+    item = payload[0]
+    return item if isinstance(item, dict) else None
+
+
+def container_env_map(inspect_payload: dict[str, object]) -> dict[str, str]:
+    config = as_dict(inspect_payload.get("Config")) or {}
+    out: dict[str, str] = {}
+    for entry in as_list(config.get("Env")):
+        text = as_str(entry)
+        if "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        if key:
+            out[key] = value
+    return out
+
+
+def container_mount_sources(inspect_payload: dict[str, object]) -> list[str]:
+    out: list[str] = []
+    for mount in as_list(inspect_payload.get("Mounts")):
+        item = as_dict(mount)
+        if not item:
+            continue
+        source = as_str(item.get("Source"))
+        if source:
+            out.append(source)
+    return out
+
+
+def extract_payload_path(cmdline: str) -> str | None:
+    match = re.search(r"base64\s+-d>(/[^\s;]+)", cmdline)
+    if match:
+        return os.path.normpath(match.group(1))
+    match = re.search(r"\bsh\s+(\/[^\s;]+)", cmdline)
+    if match:
+        return os.path.normpath(match.group(1))
+    return None
+
+
+def container_candidate_score(cmdline: str, exe: str, reasons: list[str], env_payload: str | None, mount_sources: list[str], restart_policy: str) -> int:
+    score = len(reasons)
+    lower = " ".join([exe, cmdline, env_payload or ""]).lower()
+    score += sum(1 for token in CONTAINER_IOC_TOKENS if token in lower)
+    if is_system_binary_path(exe):
+        score += 2
+    if restart_policy == "always":
+        score += 2
+    if "/" in mount_sources:
+        score += 3
+    if "/var/run/docker.sock" in mount_sources:
+        score += 3
+    if "base64 -d>/tmp/" in lower:
+        score += 3
+    return score
+
+
+def extract_writable_path_candidates(status: dict[str, object]) -> list[Candidate]:
     threat = as_dict(status.get("threat")) or {}
     rows = as_list(threat.get("suspicious_processes"))
     out: list[Candidate] = []
@@ -256,14 +419,105 @@ def extract_candidates(status: dict[str, object]) -> list[Candidate]:
     return out[:MAX_CANDIDATES]
 
 
-def build_armed_state(status: dict[str, object], candidates: list[Candidate]) -> dict[str, object]:
+def extract_container_loader_candidates(status: dict[str, object]) -> list[Candidate]:
+    threat = as_dict(status.get("threat")) or {}
+    rows = as_list(threat.get("suspicious_processes"))
+    out: list[Candidate] = []
+    seen_containers: set[str] = set()
+
+    for raw in rows:
+        row = as_dict(raw)
+        if not row:
+            continue
+        pid = as_int(row.get("pid"))
+        if pid <= 1:
+            continue
+        exe = os.path.normpath(as_str(row.get("exe")))
+        if not exe or not exe.startswith("/") or not is_system_binary_path(exe):
+            continue
+        cmdline = as_str(row.get("cmdline"))
+        if not cmdline:
+            continue
+        container_id = docker_container_id_for_pid(pid)
+        if not container_id or container_id in seen_containers:
+            continue
+        inspect_payload = docker_inspect(container_id)
+        if not inspect_payload:
+            continue
+
+        env_map = container_env_map(inspect_payload)
+        decoded_payload = decode_base64_text(env_map.get("P", ""))
+        mount_sources = container_mount_sources(inspect_payload)
+        host_config = as_dict(inspect_payload.get("HostConfig")) or {}
+        restart_policy = as_str((as_dict(host_config.get("RestartPolicy")) or {}).get("Name"))
+        reasons = [as_str(item) for item in as_list(row.get("reasons")) if as_str(item)]
+        if "/" in mount_sources:
+            reasons.append("container has host-root bind mount")
+        if "/var/run/docker.sock" in mount_sources:
+            reasons.append("container has docker socket bind mount")
+        if decoded_payload and any(token in decoded_payload.lower() for token in CONTAINER_IOC_TOKENS):
+            reasons.append("container env decodes to remote loader command")
+        payload_path = extract_payload_path(cmdline)
+        payload_host_path = f"/proc/{pid}/root{payload_path}" if payload_path and payload_path.startswith("/") else None
+        if payload_path:
+            reasons.append(f"payload loop drops or replays {payload_path}")
+        reasons = list(dict.fromkeys([reason for reason in reasons if reason]))
+        score = container_candidate_score(cmdline, exe, reasons, decoded_payload, mount_sources, restart_policy)
+        if score < 7:
+            continue
+        seen_containers.add(container_id)
+        payload_sha256 = sha256_file(Path(payload_host_path)) if payload_host_path else None
+        config = as_dict(inspect_payload.get("Config")) or {}
+        name = as_str(inspect_payload.get("Name")).lstrip("/") or container_id[:12]
+        image = as_str(config.get("Image")) or None
+        out.append(
+            Candidate(
+                pid=pid,
+                user=as_str(row.get("user")) or "root",
+                proc=as_str(row.get("proc")) or Path(exe).name,
+                exe=exe,
+                cmdline=cmdline,
+                reasons=reasons,
+                score=score,
+                scope="container",
+                container_id=container_id,
+                container_name=name,
+                container_image=image,
+                container_restart_policy=restart_policy or None,
+                payload_path=payload_path,
+                payload_host_path=payload_host_path,
+                payload_sha256=payload_sha256,
+                decoded_payload=decoded_payload,
+            )
+        )
+
+    out.sort(key=lambda item: (item.score, item.pid), reverse=True)
+    return out[:MAX_CANDIDATES]
+
+
+def extract_candidates(status: dict[str, object], playbook_id: str) -> list[Candidate]:
+    if playbook_id == "zap-02-busybox-loader-cutoff":
+        return extract_container_loader_candidates(status)
+    return extract_writable_path_candidates(status)
+
+
+def build_armed_state(status: dict[str, object], candidates: list[Candidate], playbook_id: str) -> dict[str, object]:
     alerts = as_list(status.get("alerts"))
     armed = bool(candidates)
-    reason = "No miner-persistence candidates matched the current threat snapshot."
+    if playbook_id == "zap-02-busybox-loader-cutoff":
+        reason = "No BusyBox-style container loader candidates matched the current threat snapshot."
+    else:
+        reason = "No miner-persistence candidates matched the current threat snapshot."
     if candidates:
-        reason = f"{len(candidates)} suspicious runtime candidate(s) matched the Counterstrike playbook."
+        if playbook_id == "zap-02-busybox-loader-cutoff":
+            reason = f"{len(candidates)} container loader candidate(s) matched the Counterstrike playbook."
+        else:
+            reason = f"{len(candidates)} suspicious runtime candidate(s) matched the Counterstrike playbook."
     elif any(as_str(as_dict(alert).get("code")) == "suspicious_process_ioc" for alert in alerts if as_dict(alert)):
-        reason = "Threat feed still reports suspicious runtime IOC activity, but no safe Counterstrike candidates matched."
+        if playbook_id == "zap-02-busybox-loader-cutoff":
+            reason = "Threat feed still reports suspicious runtime IOC activity, but no BusyBox/container loader matches were safe enough to arm."
+        else:
+            reason = "Threat feed still reports suspicious runtime IOC activity, but no safe Counterstrike candidates matched."
     return {
         "active": armed,
         "label": "armed" if armed else "standby",
@@ -486,6 +740,80 @@ def quarantine_executable(candidate: Candidate, evidence_dir: Path, progress: Pr
             return False, str(target), f"failed to quarantine executable: {err}"
 
 
+def capture_container_evidence(candidate: Candidate, evidence_dir: Path, progress: Progress) -> None:
+    if not candidate.container_id:
+        return
+    container_dir = evidence_dir / "containers"
+    container_dir.mkdir(parents=True, exist_ok=True)
+    slug = sanitize_slug(candidate.container_name or candidate.container_id)
+
+    inspect_run = run_command(
+        ["docker", "inspect", candidate.container_id],
+        progress,
+        allow_fail=True,
+        timeout=min(COMMAND_TIMEOUT_SECONDS, 20),
+    )
+    if inspect_run.returncode == 0 and (inspect_run.stdout or "").strip():
+        (container_dir / f"{slug}.inspect.json").write_text(inspect_run.stdout, encoding="utf-8")
+
+    logs_run = run_command(
+        ["docker", "logs", "--tail", "120", candidate.container_id],
+        progress,
+        allow_fail=True,
+        timeout=min(COMMAND_TIMEOUT_SECONDS, 20),
+    )
+    logs_text = (logs_run.stdout or "") + ("\n" + logs_run.stderr if logs_run.stderr else "")
+    if logs_text.strip():
+        (container_dir / f"{slug}.logs.txt").write_text(logs_text, encoding="utf-8")
+
+    if candidate.decoded_payload:
+        (container_dir / f"{slug}.decoded-payload.sh").write_text(candidate.decoded_payload + "\n", encoding="utf-8")
+
+
+def quarantine_payload_artifact(candidate: Candidate, evidence_dir: Path, progress: Progress) -> tuple[bool, str | None, str]:
+    if not candidate.payload_host_path:
+        return True, None, "no writable payload artifact matched"
+    source = Path(candidate.payload_host_path)
+    if not source.exists():
+        if candidate.decoded_payload:
+            quarantine_dir = evidence_dir / "quarantine"
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            target = unique_path(quarantine_dir, f"{sanitize_slug(candidate.container_name or candidate.pid)}-decoded.sh")
+            target.write_text(candidate.decoded_payload + "\n", encoding="utf-8")
+            return True, str(target), "decoded payload captured from container env"
+        return True, None, f"payload already missing at {candidate.payload_host_path}"
+
+    quarantine_dir = evidence_dir / "quarantine"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    target = unique_path(quarantine_dir, source.name)
+    try:
+        shutil.copy2(source, target)
+        progress.append(f"Evidence copy saved: {target}")
+    except Exception as err:
+        progress.append(f"Failed to copy payload artifact for evidence: {err}")
+    try:
+        source.unlink()
+        return True, str(target), "payload artifact quarantined"
+    except Exception as err:
+        return False, str(target), f"failed to remove payload artifact: {err}"
+
+
+def remove_container(candidate: Candidate, progress: Progress) -> tuple[bool, str]:
+    if not candidate.container_id:
+        return False, "container id missing"
+    run = run_command(
+        ["docker", "rm", "-f", candidate.container_id],
+        progress,
+        allow_fail=True,
+        timeout=max(COMMAND_TIMEOUT_SECONDS, 60),
+    )
+    output = (run.stdout or run.stderr or "").strip()
+    if run.returncode == 0:
+        label = candidate.container_name or candidate.container_id[:12]
+        return True, output or f"container {label} removed"
+    return False, output or f"failed to remove container {candidate.container_id[:12]}"
+
+
 def cron_matchers_for_candidate(candidate: Candidate) -> set[str]:
     markers = {candidate.exe.lower()}
     argv0 = candidate.cmdline.split()[0].strip() if candidate.cmdline.strip() else ""
@@ -703,40 +1031,97 @@ def build_planned_actions(
     return {
         "candidate_count": len(candidates),
         "stop_pids": [candidate.pid for candidate in candidates],
-        "quarantine_paths": [candidate.exe for candidate in candidates],
+        "quarantine_paths": [
+            candidate.payload_host_path or candidate.payload_path or candidate.exe for candidate in candidates
+        ],
         "cron_removed_lines": cron_removed,
         "cron_changed_targets": changed_targets,
+        "container_remove_names": [
+            candidate.container_name or candidate.container_id[:12]
+            for candidate in candidates
+            if candidate.container_id
+        ],
     }
 
 
 def log_planned_actions(
-    progress: Progress, candidates: list[Candidate], cron_removed: int, changed_targets: list[str]
+    progress: Progress, candidates: list[Candidate], cron_removed: int, changed_targets: list[str], playbook_id: str
 ) -> None:
     if not candidates:
         progress.append("Counterstrike plan: no safe candidates matched.")
         return
     for candidate in candidates:
-        progress.append(
-            f"plan: stop pid {candidate.pid} ({candidate.proc}) and quarantine {candidate.exe}"
-        )
+        if playbook_id == "zap-02-busybox-loader-cutoff":
+            container_label = candidate.container_name or candidate.container_id or "unknown-container"
+            payload_label = candidate.payload_path or candidate.exe
+            progress.append(
+                f"plan: stop pid {candidate.pid} ({candidate.proc}), quarantine {payload_label}, and remove container {container_label}"
+            )
+        else:
+            progress.append(
+                f"plan: stop pid {candidate.pid} ({candidate.proc}) and quarantine {candidate.exe}"
+            )
     if cron_removed > 0:
         progress.append(
             f"plan: remove {cron_removed} cron line(s) across {len(changed_targets)} target(s)"
         )
+    elif playbook_id == "zap-02-busybox-loader-cutoff":
+        progress.append("plan: container-loader playbook does not rely on cron persistence cleanup")
     else:
         progress.append("plan: no cron persistence references matched the current targets")
 
 
-def summarize_plan(candidates: list[Candidate], cron_removed: int) -> str:
+def summarize_plan(candidates: list[Candidate], cron_removed: int, playbook_id: str) -> str:
     if not candidates:
+        if playbook_id == "zap-02-busybox-loader-cutoff":
+            return "No BusyBox/container loader candidates matched."
         return "No miner-persistence candidates matched."
+    if playbook_id == "zap-02-busybox-loader-cutoff":
+        containers = len({candidate.container_id for candidate in candidates if candidate.container_id})
+        return (
+            f"Would stop {len(candidates)} process(es), quarantine {len(candidates)} artifact(s), "
+            f"and remove {containers} rogue container(s)."
+        )
     return (
         f"Would stop {len(candidates)} process(es), quarantine {len(candidates)} executable(s), "
         f"and scrub {cron_removed} cron line(s)."
     )
 
 
-def build_summary(status: str, mode: str, candidate_count: int, quarantined_count: int, cron_removed: int) -> str:
+def build_summary(
+    status: str,
+    mode: str,
+    candidate_count: int,
+    quarantined_count: int,
+    cron_removed: int,
+    playbook_id: str,
+    removed_containers: int = 0,
+) -> str:
+    if playbook_id == "zap-02-busybox-loader-cutoff":
+        if status == "analysis_only":
+            if candidate_count == 0:
+                return "Analyzed host state. No BusyBox/container loader candidates matched."
+            return (
+                f"Analyzed {candidate_count} candidate(s). "
+                f"Counterstrike would quarantine {quarantined_count or candidate_count} artifact(s) and remove {max(removed_containers, candidate_count)} rogue container(s)."
+            )
+        if status == "dry_run":
+            if candidate_count == 0:
+                return "Dry run found no safe BusyBox/container loader candidates."
+            return (
+                f"Dry run matched {candidate_count} candidate(s). "
+                f"Would quarantine {quarantined_count or candidate_count} artifact(s) and remove {max(removed_containers, candidate_count)} rogue container(s)."
+            )
+        if status == "contained":
+            return (
+                f"Contained {candidate_count} candidate(s), quarantined {quarantined_count} artifact(s), "
+                f"and removed {removed_containers} rogue container(s)."
+            )
+        if status == "partial":
+            return f"Counterstrike partially completed against {candidate_count} container-loader candidate(s). Review follow-up is required."
+        if status == "blocked":
+            return "Counterstrike found no safe BusyBox/container loader candidates to act on."
+        return "Counterstrike failed before the container-loader playbook could complete."
     if status == "analysis_only":
         if candidate_count == 0:
             return "Analyzed host state. No miner-persistence candidates matched."
@@ -786,7 +1171,7 @@ def make_run_id() -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Counterstrike host playbooks.")
-    parser.add_argument("--playbook", default=PLAYBOOK["id"])
+    parser.add_argument("--playbook", default=DEFAULT_PLAYBOOK["id"])
     parser.add_argument("--mode", choices=["analyze", "dry-run", "execute"], default="analyze")
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
@@ -805,13 +1190,14 @@ def acquire_lock() -> object:
 def main() -> int:
     install_signal_handlers()
     args = parse_args()
-    if args.playbook != PLAYBOOK["id"]:
+    selected_playbook = PLAYBOOKS.get(args.playbook)
+    if not selected_playbook:
         print(json.dumps({"ok": False, "error": "unsupported playbook"}))
         return 2
 
     run_id = make_run_id()
     run_dir = RUNS_DIR / run_id
-    progress = Progress(run_id=run_id, mode=args.mode, playbook=PLAYBOOK, run_dir=run_dir)
+    progress = Progress(run_id=run_id, mode=args.mode, playbook=selected_playbook, run_dir=run_dir)
 
     try:
         lock_handle = acquire_lock()
@@ -820,7 +1206,7 @@ def main() -> int:
             "ok": False,
             "status": "blocked",
             "error": error_message(err),
-            "playbook": PLAYBOOK["id"],
+            "playbook": selected_playbook["id"],
             "mode": args.mode,
         }
         if args.json:
@@ -834,6 +1220,7 @@ def main() -> int:
     status_source: dict[str, object] = {}
     candidates: list[Candidate] = []
     quarantined_paths: list[str] = []
+    removed_containers: list[str] = []
     changed_targets: list[str] = []
     cron_removed = 0
     planned_actions: dict[str, object] = {
@@ -842,19 +1229,20 @@ def main() -> int:
         "quarantine_paths": [],
         "cron_removed_lines": 0,
         "cron_changed_targets": [],
+        "container_remove_names": [],
     }
     status_value = "failed"
     result_payload: dict[str, object] | None = None
 
     try:
-        progress.append(f"Counterstrike started for {PLAYBOOK['label']} in {args.mode} mode.")
+        progress.append(f"Counterstrike started for {selected_playbook['label']} in {args.mode} mode.")
 
         progress.set_phase("snapshot", "Collecting evidence snapshot", 1)
         status_source = extract_status_source()
         run_dir.mkdir(parents=True, exist_ok=True)
         write_json(run_dir / "status-source.json", status_source)
-        candidates = extract_candidates(status_source)
-        armed = build_armed_state(status_source, candidates)
+        candidates = extract_candidates(status_source, selected_playbook["id"])
+        armed = build_armed_state(status_source, candidates, selected_playbook["id"])
         progress.armed = armed
         progress.evidence_captured = True
         progress.persist()
@@ -863,62 +1251,128 @@ def main() -> int:
 
         progress.set_phase("classify", "Classifying playbook targets", 2)
         for candidate in candidates:
-            progress.append(
-                f"candidate pid={candidate.pid} user={candidate.user} proc={candidate.proc} exe={candidate.exe}"
-            )
+            if candidate.container_id:
+                progress.append(
+                    "candidate pid="
+                    f"{candidate.pid} user={candidate.user} proc={candidate.proc} exe={candidate.exe} "
+                    f"container={candidate.container_name or candidate.container_id[:12]} payload={candidate.payload_path or 'n/a'}"
+                )
+            else:
+                progress.append(
+                    f"candidate pid={candidate.pid} user={candidate.user} proc={candidate.proc} exe={candidate.exe}"
+                )
 
         if not candidates:
             status_value = "blocked" if args.mode == "execute" else ("dry_run" if args.mode == "dry-run" else "analysis_only")
         elif args.mode == "analyze":
-            cron_removed, changed_targets, scan_errors = scan_cron_references(candidates)
-            errors.extend(scan_errors)
+            if selected_playbook["id"] != "zap-02-busybox-loader-cutoff":
+                cron_removed, changed_targets, scan_errors = scan_cron_references(candidates)
+                errors.extend(scan_errors)
             planned_actions = build_planned_actions(candidates, cron_removed, changed_targets)
-            log_planned_actions(progress, candidates, cron_removed, changed_targets)
+            log_planned_actions(progress, candidates, cron_removed, changed_targets, selected_playbook["id"])
             status_value = "analysis_only"
         elif args.mode == "dry-run":
-            cron_removed, changed_targets, scan_errors = scan_cron_references(candidates)
-            errors.extend(scan_errors)
+            if selected_playbook["id"] != "zap-02-busybox-loader-cutoff":
+                cron_removed, changed_targets, scan_errors = scan_cron_references(candidates)
+                errors.extend(scan_errors)
             planned_actions = build_planned_actions(candidates, cron_removed, changed_targets)
-            log_planned_actions(progress, candidates, cron_removed, changed_targets)
+            log_planned_actions(progress, candidates, cron_removed, changed_targets, selected_playbook["id"])
             status_value = "dry_run"
         else:
             planned_actions = build_planned_actions(candidates, 0, [])
-            progress.set_phase("neutralize", "Stopping suspicious runtime processes", 3)
-            for candidate in candidates:
-                capture_process_evidence(candidate, progress.evidence_dir, progress)
-                stopped_ok, stopped_detail = stop_process(candidate.pid, progress)
-                progress.append(f"pid {candidate.pid}: {stopped_detail}")
-                if not stopped_ok:
-                    errors.append(f"pid {candidate.pid}: {stopped_detail}")
-                    continue
+            if selected_playbook["id"] == "zap-02-busybox-loader-cutoff":
+                progress.set_phase("neutralize", "Cutting suspicious container loader", 3)
+                for candidate in candidates:
+                    capture_process_evidence(candidate, progress.evidence_dir, progress)
+                    capture_container_evidence(candidate, progress.evidence_dir, progress)
+                    quarantined_ok, quarantined_path, quarantine_detail = quarantine_payload_artifact(
+                        candidate, progress.evidence_dir, progress
+                    )
+                    progress.append(
+                        f"{candidate.payload_path or candidate.payload_host_path or candidate.exe}: {quarantine_detail}"
+                    )
+                    if quarantined_path:
+                        quarantined_paths.append(quarantined_path)
+                    if not quarantined_ok:
+                        errors.append(
+                            f"{candidate.payload_path or candidate.payload_host_path or candidate.exe}: {quarantine_detail}"
+                        )
 
-                quarantined_ok, quarantined_path, quarantine_detail = quarantine_executable(
-                    candidate, progress.evidence_dir, progress
+                    removed_ok, removed_detail = remove_container(candidate, progress)
+                    progress.append(
+                        f"container {candidate.container_name or candidate.container_id or candidate.pid}: {removed_detail}"
+                    )
+                    if removed_ok:
+                        removed_containers.append(candidate.container_name or candidate.container_id or str(candidate.pid))
+                    else:
+                        errors.append(
+                            f"container {candidate.container_name or candidate.container_id or candidate.pid}: {removed_detail}"
+                        )
+                        stopped_ok, stopped_detail = stop_process(candidate.pid, progress)
+                        progress.append(f"pid {candidate.pid}: {stopped_detail}")
+                        if not stopped_ok:
+                            errors.append(f"pid {candidate.pid}: {stopped_detail}")
+
+                progress.set_phase("harden", "Recording container teardown and payload cleanup", 4)
+                planned_actions = build_planned_actions(candidates, 0, [])
+                progress.append(f"Removed {len(removed_containers)} rogue container(s).")
+            else:
+                progress.set_phase("neutralize", "Stopping suspicious runtime processes", 3)
+                for candidate in candidates:
+                    capture_process_evidence(candidate, progress.evidence_dir, progress)
+                    stopped_ok, stopped_detail = stop_process(candidate.pid, progress)
+                    progress.append(f"pid {candidate.pid}: {stopped_detail}")
+                    if not stopped_ok:
+                        errors.append(f"pid {candidate.pid}: {stopped_detail}")
+                        continue
+
+                    quarantined_ok, quarantined_path, quarantine_detail = quarantine_executable(
+                        candidate, progress.evidence_dir, progress
+                    )
+                    progress.append(f"{candidate.exe}: {quarantine_detail}")
+                    if quarantined_path:
+                        quarantined_paths.append(quarantined_path)
+                    if not quarantined_ok:
+                        errors.append(f"{candidate.exe}: {quarantine_detail}")
+
+                progress.set_phase("harden", "Scrubbing matching cron persistence", 4)
+                cron_removed, changed_targets, cron_errors = scrub_cron_references(
+                    candidates, progress.evidence_dir, progress
                 )
-                progress.append(f"{candidate.exe}: {quarantine_detail}")
-                if quarantined_path:
-                    quarantined_paths.append(quarantined_path)
-                if not quarantined_ok:
-                    errors.append(f"{candidate.exe}: {quarantine_detail}")
-
-            progress.set_phase("harden", "Scrubbing matching cron persistence", 4)
-            cron_removed, changed_targets, cron_errors = scrub_cron_references(
-                candidates, progress.evidence_dir, progress
-            )
-            planned_actions = build_planned_actions(candidates, cron_removed, changed_targets)
-            errors.extend(cron_errors)
-            progress.append(f"Removed {cron_removed} matching cron line(s).")
+                planned_actions = build_planned_actions(candidates, cron_removed, changed_targets)
+                errors.extend(cron_errors)
+                progress.append(f"Removed {cron_removed} matching cron line(s).")
 
             progress.set_phase("verify", "Refreshing VPS Sentry snapshot", 5)
             refresh_errors = refresh_snapshot(progress)
             errors.extend(refresh_errors)
 
             remaining_pids = [candidate.pid for candidate in candidates if process_is_alive(candidate.pid)]
-            cron_remaining = cron_references_remaining(candidates)
             if remaining_pids:
                 errors.append(f"{len(remaining_pids)} candidate pid(s) still appear alive: {remaining_pids}")
-            if cron_remaining > 0:
-                errors.append(f"{cron_remaining} cron reference(s) still match the playbook markers.")
+            if selected_playbook["id"] == "zap-02-busybox-loader-cutoff":
+                remaining_containers = [
+                    candidate.container_name or candidate.container_id or str(candidate.pid)
+                    for candidate in candidates
+                    if candidate.container_id and docker_inspect(candidate.container_id)
+                ]
+                if remaining_containers:
+                    errors.append(
+                        f"{len(remaining_containers)} rogue container(s) still exist after removal: {remaining_containers}"
+                    )
+                remaining_payloads = [
+                    candidate.payload_path or candidate.payload_host_path or candidate.exe
+                    for candidate in candidates
+                    if candidate.payload_host_path and Path(candidate.payload_host_path).exists()
+                ]
+                if remaining_payloads:
+                    errors.append(
+                        f"{len(remaining_payloads)} payload artifact(s) still exist after cleanup: {remaining_payloads}"
+                    )
+            else:
+                cron_remaining = cron_references_remaining(candidates)
+                if cron_remaining > 0:
+                    errors.append(f"{cron_remaining} cron reference(s) still match the playbook markers.")
 
             if not errors and candidates:
                 status_value = "contained"
@@ -935,14 +1389,16 @@ def main() -> int:
             len(candidates),
             len(quarantined_paths),
             cron_removed,
+            selected_playbook["id"],
+            len(removed_containers),
         )
         progress.append(summary)
         result_payload = {
             "schema_version": SCHEMA_VERSION,
             "run_id": run_id,
-            "playbook": PLAYBOOK["id"],
-            "playbook_label": PLAYBOOK["label"],
-            "playbook_title": PLAYBOOK["title"],
+            "playbook": selected_playbook["id"],
+            "playbook_label": selected_playbook["label"],
+            "playbook_title": selected_playbook["title"],
             "mode": args.mode,
             "status": status_value,
             "started_at": started_at,
@@ -961,6 +1417,7 @@ def main() -> int:
             "matched_candidates": [candidate.to_dict() for candidate in candidates],
             "planned_actions": planned_actions,
             "quarantined_paths": quarantined_paths,
+            "removed_containers": removed_containers,
             "cron_removed_lines": cron_removed,
             "cron_changed_targets": changed_targets,
             "errors": errors,
@@ -986,9 +1443,9 @@ def main() -> int:
                 fallback = {
                     "schema_version": SCHEMA_VERSION,
                     "run_id": run_id,
-                    "playbook": PLAYBOOK["id"],
-                    "playbook_label": PLAYBOOK["label"],
-                    "playbook_title": PLAYBOOK["title"],
+                    "playbook": selected_playbook["id"],
+                    "playbook_label": selected_playbook["label"],
+                    "playbook_title": selected_playbook["title"],
                     "mode": args.mode,
                     "status": status_value if status_value != "failed" else "failed",
                     "started_at": started_at,
@@ -1007,6 +1464,7 @@ def main() -> int:
                     "matched_candidates": [candidate.to_dict() for candidate in candidates],
                     "planned_actions": planned_actions,
                     "quarantined_paths": quarantined_paths,
+                    "removed_containers": removed_containers,
                     "cron_removed_lines": cron_removed,
                     "cron_changed_targets": changed_targets,
                     "errors": errors,
