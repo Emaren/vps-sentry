@@ -2,6 +2,8 @@
 
 Tiny VPS security monitor + "ship" hook, designed for systemd.
 
+Current verified production handoff: [`../CURRENT_STATE.md`](../CURRENT_STATE.md)
+
 There is also an off-box external sentinel stub at `bin/vps-sentry-external-sentinel`.
 It is not installed by `scripts/install.sh`; it is meant to run from the MBP or a future second VPS.
 The MBP installer now copies that watcher into a fixed bundle under `~/Library/Application Support/VPSSentry/external-sentinel/`
@@ -105,6 +107,9 @@ The repo includes an installer script so you don’t have to copy/paste a giant 
 
 * `git pull`
 * `./scripts/install.sh` (reinstalls binaries/units; syncs tracked runtime detector source; timer stays enabled)
+
+If the VPS checkout cannot `git pull`, do not guess your way through a deploy.
+Check [`../CURRENT_STATE.md`](../CURRENT_STATE.md) first for the currently known production deploy caveats and cleanup order.
 
 If you intentionally changed watched things, re-accept baseline:
 
