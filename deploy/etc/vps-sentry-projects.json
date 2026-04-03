@@ -1,4 +1,11 @@
 {
+  "host_filesystems": [
+    {
+      "id": "hetzner-volume",
+      "label": "Mounted Volume",
+      "path": "/mnt/HC_Volume_105319120"
+    }
+  ],
   "projects": [
     {
       "id": "vps-sentry",
@@ -51,12 +58,11 @@
       }
     },
     {
-      "id": "4o",
-      "label": "4o API",
-      "public_url": "https://api.4o.tokentap.ca",
+      "id": "wolochain",
+      "label": "WoloChain",
       "storage": {
         "roots": [
-          "/var/www/4o"
+          "/var/www/WoloChain"
         ]
       }
     },
@@ -159,13 +165,31 @@
       }
     },
     {
+      "id": "wallygotchi",
+      "label": "Wallygotchi",
+      "storage": {
+        "roots": [
+          "/var/www/Wallygotchi"
+        ]
+      }
+    },
+    {
       "id": "wallyverse",
       "label": "Wallyverse",
       "public_url": "https://wallyverse.tokentap.ca",
       "storage": {
         "roots": [
-          "/home/tony/projects/wallyverse-web",
-          "/home/tony/projects/wallyverse-api"
+          "/var/www/Wallyverse"
+        ]
+      }
+    },
+    {
+      "id": "4o",
+      "label": "4o API",
+      "public_url": "https://api.4o.tokentap.ca",
+      "storage": {
+        "roots": [
+          "/var/www/4o"
         ]
       }
     },

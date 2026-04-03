@@ -16,7 +16,7 @@ PROJECTS_FILE = Path(os.environ.get("VPS_SENTRY_PROJECTS_FILE", "/etc/vps-sentry
 TTL_SECONDS = max(60, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TTL_SECONDS", "3600")))
 TOP_DIR_LIMIT = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_LIMIT", "5")))
 TOP_DIR_DEPTH = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_DEPTH", "2")))
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 HOST_FILESYSTEM_PATH = Path(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_HOST_FS_PATH", "/"))
 HOST_DISK_WARN_PCT = max(1, min(100, int(os.environ.get("VPS_SENTRY_HOST_DISK_WARN_PCT", "85"))))
 HOST_DISK_FAIL_PCT = max(HOST_DISK_WARN_PCT, min(100, int(os.environ.get("VPS_SENTRY_HOST_DISK_FAIL_PCT", "92"))))
@@ -301,25 +301,47 @@ def unique_paths(paths: list[Path]) -> list[Path]:
     return unique
 
 
-def measure_host_filesystem() -> dict[str, object]:
-    path = HOST_FILESYSTEM_PATH if HOST_FILESYSTEM_PATH.exists() else Path("/")
-    vfs = os.statvfs(str(path))
-    block_size = int(vfs.f_frsize or vfs.f_bsize or 0)
-    total_bytes = int(vfs.f_blocks * block_size) if block_size > 0 else 0
-    # Match `df` and the live dashboard gauge: only count bytes still available to non-root.
-    available_bytes = int(vfs.f_bavail * block_size) if block_size > 0 else 0
-    used_bytes = max(0, total_bytes - available_bytes)
-    used_percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else None
+def load_config() -> dict[str, object]:
+    if not PROJECTS_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(PROJECTS_FILE.read_text())
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        log(f"warn: failed to parse {PROJECTS_FILE}: {exc}")
+        return {}
 
-    if isinstance(used_percent, float) and used_percent >= HOST_DISK_FAIL_PCT:
-        level = "critical"
-    elif isinstance(used_percent, float) and used_percent >= HOST_DISK_WARN_PCT:
-        level = "warn"
-    else:
-        level = "ok"
 
-    return {
+def measure_filesystem(path: Path, *, fs_id: str | None = None, label: str | None = None) -> dict[str, object]:
+    exists = path.exists()
+    total_bytes = 0
+    available_bytes = 0
+    used_bytes = 0
+    used_percent = None
+    level = "warn" if not exists else "ok"
+
+    if exists:
+        try:
+            vfs = os.statvfs(str(path))
+            block_size = int(vfs.f_frsize or vfs.f_bsize or 0)
+            total_bytes = int(vfs.f_blocks * block_size) if block_size > 0 else 0
+            available_bytes = int(vfs.f_bavail * block_size) if block_size > 0 else 0
+            used_bytes = max(0, total_bytes - available_bytes)
+            used_percent = round((used_bytes / total_bytes) * 100, 1) if total_bytes > 0 else None
+
+            if isinstance(used_percent, float) and used_percent >= HOST_DISK_FAIL_PCT:
+                level = "critical"
+            elif isinstance(used_percent, float) and used_percent >= HOST_DISK_WARN_PCT:
+                level = "warn"
+            else:
+                level = "ok"
+        except OSError:
+            exists = False
+            level = "warn"
+
+    payload: dict[str, object] = {
         "path": str(path),
+        "exists": exists,
         "measured_at": iso_utc_now(),
         "total_bytes": total_bytes,
         "used_bytes": used_bytes,
@@ -329,6 +351,99 @@ def measure_host_filesystem() -> dict[str, object]:
         "fail_percent": HOST_DISK_FAIL_PCT,
         "level": level,
     }
+    if fs_id is not None:
+        payload["id"] = fs_id
+    if label is not None:
+        payload["label"] = label
+    return payload
+
+
+def measure_host_filesystem() -> dict[str, object]:
+    path = HOST_FILESYSTEM_PATH if HOST_FILESYSTEM_PATH.exists() else Path("/")
+    return measure_filesystem(path)
+
+
+def load_projects(config: dict[str, object] | None = None) -> list[dict[str, object]]:
+    payload = config if isinstance(config, dict) else load_config()
+    projects = payload.get("projects")
+    if not isinstance(projects, list):
+        return []
+    return [project for project in projects if isinstance(project, dict)]
+
+
+def load_mounted_host_filesystems(config: dict[str, object] | None = None) -> list[dict[str, str]]:
+    payload = config if isinstance(config, dict) else load_config()
+    raw_filesystems = payload.get("host_filesystems")
+    if not isinstance(raw_filesystems, list):
+        return []
+
+    filesystems: list[dict[str, str]] = []
+    for index, raw_entry in enumerate(raw_filesystems):
+        if isinstance(raw_entry, str):
+            path = raw_entry.strip()
+            if not path:
+                continue
+            filesystems.append(
+                {
+                    "id": f"host-fs-{index + 1}",
+                    "label": Path(path).name or path,
+                    "path": path,
+                }
+            )
+            continue
+
+        if not isinstance(raw_entry, dict):
+            continue
+
+        path = str(raw_entry.get("path") or "").strip()
+        if not path:
+            continue
+
+        fs_id = str(raw_entry.get("id") or "").strip() or f"host-fs-{index + 1}"
+        label = str(raw_entry.get("label") or "").strip() or (Path(path).name or path)
+
+        filesystems.append(
+            {
+                "id": fs_id,
+                "label": label,
+                "path": path,
+            }
+        )
+
+    return filesystems
+
+
+def measure_mounted_filesystems(config: dict[str, object] | None = None) -> list[dict[str, object]]:
+    payload = config if isinstance(config, dict) else load_config()
+    mounted: list[dict[str, object]] = []
+
+    try:
+        root_key = str((HOST_FILESYSTEM_PATH if HOST_FILESYSTEM_PATH.exists() else Path("/")).resolve())
+    except Exception:
+        root_key = str(HOST_FILESYSTEM_PATH)
+
+    seen: set[str] = {root_key}
+
+    for fs in load_mounted_host_filesystems(payload):
+        path = Path(fs["path"])
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+
+        if key in seen:
+            continue
+        seen.add(key)
+
+        mounted.append(
+            measure_filesystem(
+                path,
+                fs_id=fs["id"],
+                label=fs["label"],
+            )
+        )
+
+    return mounted
 
 
 def measure_path(path: Path) -> dict[str, int]:
@@ -466,20 +581,6 @@ def measure_root(root_path: str, storage_config: dict[str, object] | None = None
     }
 
 
-def load_projects() -> list[dict[str, object]]:
-    if not PROJECTS_FILE.exists():
-        return []
-    try:
-        payload = json.loads(PROJECTS_FILE.read_text())
-    except Exception as exc:
-        log(f"warn: failed to parse {PROJECTS_FILE}: {exc}")
-        return []
-    projects = payload.get("projects")
-    if not isinstance(projects, list):
-        return []
-    return [project for project in projects if isinstance(project, dict)]
-
-
 def previous_project_snapshot(previous_snapshot: dict[str, object] | None, project_id: str) -> dict[str, object] | None:
     if not isinstance(previous_snapshot, dict):
         return None
@@ -516,8 +617,10 @@ def project_growth_fields(
 
 def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[str, object]:
     measured_at = iso_utc_now()
+    config = load_config()
     projects_payload: dict[str, object] = {}
-    for project in load_projects():
+
+    for project in load_projects(config):
         project_id = str(project.get("id", "")).strip()
         if not project_id:
             continue
@@ -600,6 +703,7 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
         "top_dirs_depth": TOP_DIR_DEPTH,
         "bucket_order": BUCKET_ORDER,
         "host_filesystem": measure_host_filesystem(),
+        "mounted_filesystems": measure_mounted_filesystems(config),
         "projects": projects_payload,
     }
 
@@ -752,6 +856,7 @@ def main() -> int:
     except Exception as exc:
         log(f"warn: lock unavailable, continuing without it: {exc}")
 
+    config = load_config()
     previous_snapshot = load_previous_snapshot()
     snapshot = load_cached_snapshot()
     if snapshot is None:
@@ -763,6 +868,7 @@ def main() -> int:
     else:
         log("using cached project storage snapshot")
         snapshot["host_filesystem"] = measure_host_filesystem()
+        snapshot["mounted_filesystems"] = measure_mounted_filesystems(config)
 
     storage_alerts = build_storage_alerts(snapshot)
 
