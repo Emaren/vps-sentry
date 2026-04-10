@@ -39,7 +39,7 @@ Runs on a systemd timer (default: every 5 minutes):
 8. **Actionable public-port intelligence**  
    Detects public listener drift and enriches alerts with PID/unit/exe/cmdline process attribution.
 9. **Publish + normalize pipeline for dashboards**  
-   Generates sanitized `/var/lib/vps-sentry/public/status.json` and computes expected vs unexpected public ports.
+   Generates sanitized `/var/lib/vps-sentry/public/status.json`, computes expected vs unexpected public ports, and publishes `project_storage` host/mounted-volume telemetry for the operator UI.
 10. **Noise controls + memory of seen SSH identities**  
    Uses thresholds, webhook cooldowns, and TTL-based "new SSH accept" memory to reduce repeat spam.
 11. **Dual-channel notifications + evidence shipping**  
@@ -272,6 +272,16 @@ State (runtime):
 * `/var/lib/vps-sentry/` (baseline, last run, diffs, ship marker, etc.)
 * `/var/lib/vps-sentry/public/` (`status.json`, `last.json`, `diff.json` published for UI/API)
 * `/var/lib/vps-sentry/forensics/evidence/` (signed manifests, signatures, ledger, sealed bundle copies)
+
+Mounted volume telemetry:
+
+* `/etc/vps-sentry-projects.json` can declare extra host filesystems under `host_filesystems`.
+* `/usr/local/bin/vps-sentry-project-storage` measures those mounts on every patrol merge, even when project-root totals are served from cache.
+* `project_storage.mounted_filesystems[]` in published `status.json` carries:
+  * live capacity and usage (`total_bytes`, `used_bytes`, `available_bytes`, `used_percent`)
+  * stable identity (`id`, `label`, `path`)
+  * resize metadata when the mount capacity changes between snapshots (`previous_total_bytes`, `capacity_changed_bytes`, `capacity_change_direction`)
+* Result: rare provider-side disk resizes such as a Hetzner volume expansion are detected automatically on the next patrol run instead of needing a manual UI-side constant update.
 
 Signing key material:
 
