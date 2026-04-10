@@ -312,7 +312,42 @@ def load_config() -> dict[str, object]:
         return {}
 
 
-def measure_filesystem(path: Path, *, fs_id: str | None = None, label: str | None = None) -> dict[str, object]:
+def previous_mounted_filesystem(
+    previous_snapshot: dict[str, object] | None,
+    *,
+    fs_id: str | None = None,
+    path: str | None = None,
+) -> dict[str, object] | None:
+    if not isinstance(previous_snapshot, dict):
+        return None
+
+    mounted = previous_snapshot.get("mounted_filesystems")
+    if not isinstance(mounted, list):
+        return None
+
+    normalized_id = fs_id.strip() if isinstance(fs_id, str) and fs_id.strip() else None
+    normalized_path = path.strip() if isinstance(path, str) and path.strip() else None
+
+    for entry in mounted:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "").strip() or None
+        entry_path = str(entry.get("path") or "").strip() or None
+        if normalized_id and entry_id == normalized_id:
+            return entry
+        if normalized_path and entry_path == normalized_path:
+            return entry
+
+    return None
+
+
+def measure_filesystem(
+    path: Path,
+    *,
+    fs_id: str | None = None,
+    label: str | None = None,
+    previous_total_bytes: int | None = None,
+) -> dict[str, object]:
     exists = path.exists()
     total_bytes = 0
     available_bytes = 0
@@ -355,6 +390,10 @@ def measure_filesystem(path: Path, *, fs_id: str | None = None, label: str | Non
         payload["id"] = fs_id
     if label is not None:
         payload["label"] = label
+    if isinstance(previous_total_bytes, int) and previous_total_bytes > 0 and total_bytes != previous_total_bytes:
+        payload["previous_total_bytes"] = previous_total_bytes
+        payload["capacity_changed_bytes"] = total_bytes - previous_total_bytes
+        payload["capacity_change_direction"] = "expanded" if total_bytes > previous_total_bytes else "shrunk"
     return payload
 
 
@@ -413,7 +452,10 @@ def load_mounted_host_filesystems(config: dict[str, object] | None = None) -> li
     return filesystems
 
 
-def measure_mounted_filesystems(config: dict[str, object] | None = None) -> list[dict[str, object]]:
+def measure_mounted_filesystems(
+    config: dict[str, object] | None = None,
+    previous_snapshot: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
     payload = config if isinstance(config, dict) else load_config()
     mounted: list[dict[str, object]] = []
 
@@ -435,11 +477,19 @@ def measure_mounted_filesystems(config: dict[str, object] | None = None) -> list
             continue
         seen.add(key)
 
+        previous_entry = previous_mounted_filesystem(
+            previous_snapshot,
+            fs_id=fs["id"],
+            path=fs["path"],
+        )
+        previous_total_bytes = previous_entry.get("total_bytes") if isinstance(previous_entry, dict) else None
+
         mounted.append(
             measure_filesystem(
                 path,
                 fs_id=fs["id"],
                 label=fs["label"],
+                previous_total_bytes=previous_total_bytes if isinstance(previous_total_bytes, int) else None,
             )
         )
 
@@ -703,7 +753,7 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
         "top_dirs_depth": TOP_DIR_DEPTH,
         "bucket_order": BUCKET_ORDER,
         "host_filesystem": measure_host_filesystem(),
-        "mounted_filesystems": measure_mounted_filesystems(config),
+        "mounted_filesystems": measure_mounted_filesystems(config, previous_snapshot),
         "projects": projects_payload,
     }
 
@@ -868,7 +918,7 @@ def main() -> int:
     else:
         log("using cached project storage snapshot")
         snapshot["host_filesystem"] = measure_host_filesystem()
-        snapshot["mounted_filesystems"] = measure_mounted_filesystems(config)
+        snapshot["mounted_filesystems"] = measure_mounted_filesystems(config, previous_snapshot)
 
     storage_alerts = build_storage_alerts(snapshot)
 
