@@ -279,9 +279,17 @@ Mounted volume telemetry:
 * `/usr/local/bin/vps-sentry-project-storage` measures those mounts on every patrol merge, even when project-root totals are served from cache.
 * `project_storage.mounted_filesystems[]` in published `status.json` carries:
   * live capacity and usage (`total_bytes`, `used_bytes`, `available_bytes`, `used_percent`)
+  * backing block-device capacity when Linux exposes it (`device_source`, `device_size_bytes`)
+  * pending filesystem-grow metadata when the block device is larger than the mounted filesystem (`filesystem_resize_pending`, `filesystem_gap_bytes`)
   * stable identity (`id`, `label`, `path`)
   * resize metadata when the mount capacity changes between snapshots (`previous_total_bytes`, `capacity_changed_bytes`, `capacity_change_direction`)
-* Result: rare provider-side disk resizes such as a Hetzner volume expansion are detected automatically on the next patrol run instead of needing a manual UI-side constant update.
+* Result: rare provider-side disk resizes such as a Hetzner volume expansion are detected on the next patrol run. If the provider device has grown but the guest filesystem has not, VPSSentry reports the pending filesystem resize instead of pretending the extra space is usable.
+* Project roots also carry residency truth:
+  * each root reports its configured `path`, resolved `real_path`, and `storage_location`
+  * `storage_location.class` distinguishes `root_disk`, `mounted_volume`, `symlinked_to_volume`, `other_mount`, and `missing`
+  * project totals publish `root_resident_bytes`, `mounted_volume_bytes`, `symlinked_to_volume_bytes`, `volume_backed_bytes`, and `storage_label`
+  * `project_storage.root_residency` summarizes root-resident project mass and top root consumers by reclaim posture category
+* VPS-side discovery is host-side only. `project_storage.discovery.candidates[]` reports likely untracked project roots found under `/var/www` and configured mounted-volume project roots. Local MBP project discovery must come from local command-driven tooling or a committed registry entry; the web UI must not pretend the browser can inspect arbitrary local folders.
 
 Signing key material:
 

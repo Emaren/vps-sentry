@@ -58,6 +58,16 @@
       }
     },
     {
+      "id": "aoe2dewarwagers",
+      "label": "AoE2DEWarWagers",
+      "public_url": "https://aoe2dewarwagers.com",
+      "storage": {
+        "roots": [
+          "/var/www/AoE2DEWarWagers"
+        ]
+      }
+    },
+    {
       "id": "wolochain",
       "label": "WoloChain",
       "storage": {

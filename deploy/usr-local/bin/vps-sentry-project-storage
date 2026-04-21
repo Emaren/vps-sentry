@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,10 +17,13 @@ PROJECTS_FILE = Path(os.environ.get("VPS_SENTRY_PROJECTS_FILE", "/etc/vps-sentry
 TTL_SECONDS = max(60, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TTL_SECONDS", "3600")))
 TOP_DIR_LIMIT = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_LIMIT", "5")))
 TOP_DIR_DEPTH = max(1, int(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_TOP_DIR_DEPTH", "2")))
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 HOST_FILESYSTEM_PATH = Path(os.environ.get("VPS_SENTRY_PROJECT_STORAGE_HOST_FS_PATH", "/"))
 HOST_DISK_WARN_PCT = max(1, min(100, int(os.environ.get("VPS_SENTRY_HOST_DISK_WARN_PCT", "85"))))
 HOST_DISK_FAIL_PCT = max(HOST_DISK_WARN_PCT, min(100, int(os.environ.get("VPS_SENTRY_HOST_DISK_FAIL_PCT", "92"))))
+FILESYSTEM_RESIZE_GAP_MIN_BYTES = 1024 * 1024 * 1024
+FILESYSTEM_RESIZE_GAP_MIN_RATIO = 0.04
+PROJECT_DISCOVERY_ROOTS = os.environ.get("VPS_SENTRY_PROJECT_DISCOVERY_ROOTS")
 PROJECT_GROWTH_WARN_BYTES = max(0, int(os.environ.get("VPS_SENTRY_PROJECT_GROWTH_WARN_BYTES", str(500 * 1024 * 1024))))
 PROJECT_GROWTH_FAIL_BYTES = max(PROJECT_GROWTH_WARN_BYTES, int(os.environ.get("VPS_SENTRY_PROJECT_GROWTH_FAIL_BYTES", str(1024 * 1024 * 1024))))
 PROJECT_STORAGE_ALERT_CODES = {
@@ -107,6 +111,37 @@ BUCKET_BY_DIR_NAME = {
     for dir_name in bucket["dir_names"]
 }
 
+STORAGE_CLASS_LABELS = {
+    "root_disk": "root disk",
+    "mounted_volume": "mounted volume",
+    "symlinked_to_volume": "symlinked to volume",
+    "other_mount": "other mount",
+    "missing": "missing",
+}
+
+ROOT_CONSUMER_CATEGORY_LABELS = {
+    "safe_reclaimable_junk": "safe reclaimable junk",
+    "backup_archive_mass": "backup/archive mass",
+    "cache_build_residue": "cache/build residue",
+    "live_runtime_project": "live/runtime/project mass",
+}
+
+BUCKET_ROOT_CONSUMER_CATEGORY = {
+    "backups_artifacts": "backup_archive_mass",
+    "build_cache": "cache_build_residue",
+    "logs": "safe_reclaimable_junk",
+    "dependencies": "live_runtime_project",
+    "runtime_data": "live_runtime_project",
+    "source": "live_runtime_project",
+}
+
+ROOT_CONSUMER_RECLAIMABILITY = {
+    "safe_reclaimable_junk": "guided",
+    "backup_archive_mass": "guided",
+    "cache_build_residue": "guided",
+    "live_runtime_project": "blocked",
+}
+
 
 def log(message: str) -> None:
     print(f"[VPS-PROJECT-STORAGE] {message}", file=sys.stderr)
@@ -157,11 +192,97 @@ def age_label(previous_ts: object, current_ts: object) -> str | None:
     return f"{max(1, minutes)}m"
 
 
+def parse_csv_paths(raw: str | None) -> list[Path]:
+    if not raw:
+        return []
+    out: list[Path] = []
+    for part in raw.split(","):
+        text = part.strip()
+        if text:
+            out.append(Path(text))
+    return out
+
+
 def run_bytes_command(args: list[str]) -> int:
     completed = subprocess.run(args, check=True, capture_output=True, text=True)
     first = completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else ""
     number = first.split(maxsplit=1)[0] if first else ""
     return int(number)
+
+
+def decode_mountinfo_field(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def resolved_path(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except Exception:
+        return Path(os.path.abspath(str(path)))
+
+
+def path_is_inside(path: Path, root: Path) -> bool:
+    if path == root:
+        return True
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def mountinfo_for_path(path: Path) -> dict[str, str] | None:
+    target = resolved_path(path)
+    best: dict[str, str] | None = None
+    best_len = -1
+
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 10 or "-" not in parts:
+            continue
+        separator_index = parts.index("-")
+        if separator_index + 2 >= len(parts):
+            continue
+
+        major_minor = parts[2]
+        mount_point = resolved_path(Path(decode_mountinfo_field(parts[4])))
+        if not path_is_inside(target, mount_point):
+            continue
+
+        mount_len = len(str(mount_point))
+        if mount_len <= best_len:
+            continue
+
+        best_len = mount_len
+        best = {
+            "major_minor": major_minor,
+            "mount_point": str(mount_point),
+            "filesystem_type": decode_mountinfo_field(parts[separator_index + 1]),
+            "device_source": decode_mountinfo_field(parts[separator_index + 2]),
+        }
+
+    return best
+
+
+def block_device_size_bytes(major_minor: str | None) -> int | None:
+    if not major_minor:
+        return None
+    try:
+        sectors = int((Path("/sys/dev/block") / major_minor / "size").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if sectors <= 0:
+        return None
+    return sectors * 512
+
+
+def filesystem_resize_gap_threshold(device_size_bytes: int) -> int:
+    return max(FILESYSTEM_RESIZE_GAP_MIN_BYTES, int(device_size_bytes * FILESYSTEM_RESIZE_GAP_MIN_RATIO))
 
 
 def count_files(root: Path) -> int:
@@ -354,6 +475,8 @@ def measure_filesystem(
     used_bytes = 0
     used_percent = None
     level = "warn" if not exists else "ok"
+    mount_info: dict[str, str] | None = None
+    device_size_bytes: int | None = None
 
     if exists:
         try:
@@ -370,6 +493,9 @@ def measure_filesystem(
                 level = "warn"
             else:
                 level = "ok"
+            mount_info = mountinfo_for_path(path)
+            if mount_info is not None:
+                device_size_bytes = block_device_size_bytes(mount_info.get("major_minor"))
         except OSError:
             exists = False
             level = "warn"
@@ -390,6 +516,16 @@ def measure_filesystem(
         payload["id"] = fs_id
     if label is not None:
         payload["label"] = label
+    if mount_info is not None:
+        payload["device_source"] = mount_info.get("device_source")
+        payload["filesystem_type"] = mount_info.get("filesystem_type")
+        payload["mount_point"] = mount_info.get("mount_point")
+    if isinstance(device_size_bytes, int) and device_size_bytes > 0:
+        payload["device_size_bytes"] = device_size_bytes
+        gap_bytes = device_size_bytes - total_bytes
+        if total_bytes > 0 and gap_bytes > filesystem_resize_gap_threshold(device_size_bytes):
+            payload["filesystem_gap_bytes"] = gap_bytes
+            payload["filesystem_resize_pending"] = True
     if isinstance(previous_total_bytes, int) and previous_total_bytes > 0 and total_bytes != previous_total_bytes:
         payload["previous_total_bytes"] = previous_total_bytes
         payload["capacity_changed_bytes"] = total_bytes - previous_total_bytes
@@ -494,6 +630,74 @@ def measure_mounted_filesystems(
         )
 
     return mounted
+
+
+def mounted_filesystem_lookup(config: dict[str, object] | None = None) -> dict[str, dict[str, str]]:
+    lookup: dict[str, dict[str, str]] = {}
+    payload = config if isinstance(config, dict) else load_config()
+    for fs in load_mounted_host_filesystems(payload):
+        try:
+            key = str(resolved_path(Path(fs["path"])))
+        except Exception:
+            key = fs["path"]
+        lookup[key] = fs
+    return lookup
+
+
+def storage_class_label(storage_class: str) -> str:
+    return STORAGE_CLASS_LABELS.get(storage_class, storage_class.replace("_", " "))
+
+
+def storage_location_for_path(path: Path, config: dict[str, object] | None = None) -> dict[str, object]:
+    exists = path.exists()
+    is_symlink = path.is_symlink()
+    real_path = resolved_path(path) if exists else path
+    mount_info = mountinfo_for_path(real_path) if exists else None
+    mount_point = str(mount_info.get("mount_point") or "") if mount_info else ""
+    fs_lookup = mounted_filesystem_lookup(config)
+    mounted_fs = fs_lookup.get(mount_point)
+
+    if not exists:
+        storage_class = "missing"
+    elif mounted_fs is not None and is_symlink:
+        storage_class = "symlinked_to_volume"
+    elif mounted_fs is not None:
+        storage_class = "mounted_volume"
+    elif mount_point == "/" or not mount_point:
+        storage_class = "root_disk"
+    else:
+        storage_class = "other_mount"
+
+    payload: dict[str, object] = {
+        "class": storage_class,
+        "label": storage_class_label(storage_class),
+        "path": str(path),
+        "real_path": str(real_path),
+        "is_symlink": is_symlink,
+        "is_root_resident": storage_class == "root_disk",
+        "is_volume_backed": storage_class in {"mounted_volume", "symlinked_to_volume"},
+    }
+
+    if mount_info is not None:
+        payload["mount_point"] = mount_info.get("mount_point")
+        payload["device_source"] = mount_info.get("device_source")
+        payload["filesystem_type"] = mount_info.get("filesystem_type")
+    if mounted_fs is not None:
+        payload["volume_id"] = mounted_fs.get("id")
+        payload["volume_label"] = mounted_fs.get("label")
+    return payload
+
+
+def storage_byte_key(storage_class: str) -> str:
+    if storage_class == "root_disk":
+        return "root_resident_bytes"
+    if storage_class == "symlinked_to_volume":
+        return "symlinked_to_volume_bytes"
+    if storage_class == "mounted_volume":
+        return "mounted_volume_bytes"
+    if storage_class == "other_mount":
+        return "other_mount_bytes"
+    return "unknown_storage_bytes"
 
 
 def measure_path(path: Path) -> dict[str, int]:
@@ -606,28 +810,36 @@ def measure_root(root_path: str, storage_config: dict[str, object] | None = None
     storage = storage_config if isinstance(storage_config, dict) else {}
     root = Path(root_path)
     root_label = root.name or root_path.rstrip("/").split("/")[-1] or root_path
+    storage_location = storage_location_for_path(root, load_config())
     if not root.exists():
         return {
             "label": root_label,
+            "path": root_path,
+            "real_path": str(root),
             "exists": False,
+            "storage_location": storage_location,
             "buckets": {},
         }
 
-    total = measure_path(root)
+    measure_root_path = resolved_path(root)
+    total = measure_path(measure_root_path)
     buckets = add_source_bucket(
         total["disk_bytes"],
         total["apparent_bytes"],
         total["file_count"],
-        measure_buckets(root, storage),
+        measure_buckets(measure_root_path, storage),
     )
     return {
         "label": root_label,
+        "path": root_path,
+        "real_path": str(measure_root_path),
         "exists": True,
         "disk_bytes": total["disk_bytes"],
         "apparent_bytes": total["apparent_bytes"],
         "file_count": total["file_count"],
+        "storage_location": storage_location,
         "buckets": buckets,
-        "largest_dirs": largest_dirs(root, root_label),
+        "largest_dirs": largest_dirs(measure_root_path, root_label),
     }
 
 
@@ -665,10 +877,261 @@ def project_growth_fields(
     project_payload["delta_file_count"] = total_files - previous_files
 
 
+def consumer_category_for_bucket(bucket_id: str) -> str:
+    return BUCKET_ROOT_CONSUMER_CATEGORY.get(bucket_id, "live_runtime_project")
+
+
+def root_consumer_row(
+    *,
+    project_id: str,
+    project_label: str,
+    root_data: dict[str, object],
+    bucket_id: str,
+    bucket: dict[str, object],
+) -> dict[str, object] | None:
+    disk_bytes = bucket.get("disk_bytes")
+    if not isinstance(disk_bytes, int) or disk_bytes <= 0:
+        return None
+
+    category = consumer_category_for_bucket(bucket_id)
+    root_path = str(root_data.get("path") or root_data.get("real_path") or "")
+    storage_location = root_data.get("storage_location") if isinstance(root_data.get("storage_location"), dict) else {}
+    return {
+        "id": f"{project_id}:{bucket_id}:{root_path}",
+        "project_id": project_id,
+        "project_label": project_label,
+        "path": root_path,
+        "real_path": str(root_data.get("real_path") or root_path),
+        "label": str(bucket.get("label") or BUCKET_LABELS.get(bucket_id) or bucket_id),
+        "bytes": disk_bytes,
+        "bucket": bucket_id,
+        "category": category,
+        "category_label": ROOT_CONSUMER_CATEGORY_LABELS.get(category, category.replace("_", " ")),
+        "reclaimability": ROOT_CONSUMER_RECLAIMABILITY.get(category, "unknown"),
+        "storage_class": str(storage_location.get("class") or "unknown"),
+        "storage_label": str(storage_location.get("label") or "unknown storage"),
+    }
+
+
+def root_residency_template() -> dict[str, object]:
+    return {
+        "root_resident_bytes": 0,
+        "mounted_volume_bytes": 0,
+        "symlinked_to_volume_bytes": 0,
+        "volume_backed_bytes": 0,
+        "other_mount_bytes": 0,
+        "unknown_storage_bytes": 0,
+        "top_root_projects": [],
+        "top_consumers": [],
+        "category_totals": [],
+    }
+
+
+def add_root_consumer_totals(
+    category_totals: dict[str, dict[str, object]],
+    row: dict[str, object],
+) -> None:
+    category = str(row.get("category") or "live_runtime_project")
+    total = category_totals.setdefault(
+        category,
+        {
+            "key": category,
+            "label": ROOT_CONSUMER_CATEGORY_LABELS.get(category, category.replace("_", " ")),
+            "bytes": 0,
+            "count": 0,
+        },
+    )
+    total["bytes"] = int(total.get("bytes", 0)) + int(row.get("bytes", 0))
+    total["count"] = int(total.get("count", 0)) + 1
+
+
+def storage_class_for_project(byte_splits: dict[str, int]) -> str:
+    present: list[str] = []
+    if byte_splits.get("root_resident_bytes", 0) > 0:
+        present.append("root_disk")
+    if byte_splits.get("symlinked_to_volume_bytes", 0) > 0:
+        present.append("symlinked_to_volume")
+    if byte_splits.get("mounted_volume_bytes", 0) > 0:
+        present.append("mounted_volume")
+    if byte_splits.get("other_mount_bytes", 0) > 0:
+        present.append("other_mount")
+    if not present:
+        return "missing"
+    if len(present) == 1:
+        return present[0]
+    return "mixed"
+
+
+def storage_label_for_project(storage_class: str) -> str:
+    if storage_class == "mixed":
+        return "mixed storage"
+    return storage_class_label(storage_class)
+
+
+def projectish_marker_paths(path: Path) -> list[str]:
+    markers = {
+        ".git",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "Cargo.toml",
+        "composer.json",
+        "requirements.txt",
+    }
+    out: list[str] = []
+
+    for marker in markers:
+        candidate = path / marker
+        try:
+            exists = candidate.exists()
+        except OSError:
+            exists = False
+        if exists:
+            out.append(str(candidate))
+
+    try:
+        children = [child for child in path.iterdir() if child.is_dir() and not child.is_symlink()]
+    except OSError:
+        children = []
+
+    ignored = {"node_modules", ".next", "dist", "build", ".cache", ".venv", "venv", "__pycache__"}
+    for child in children:
+        if child.name in ignored or child.name.startswith("."):
+            continue
+        for marker in markers:
+            candidate = child / marker
+            try:
+                exists = candidate.exists()
+            except OSError:
+                exists = False
+            if exists:
+                out.append(str(candidate))
+                break
+
+    return out[:8]
+
+
+def is_projectish_dir(path: Path) -> bool:
+    return len(projectish_marker_paths(path)) > 0
+
+
+def configured_project_paths(config: dict[str, object]) -> set[str]:
+    out: set[str] = set()
+    for project in load_projects(config):
+        storage = project.get("storage")
+        if not isinstance(storage, dict):
+            continue
+        roots = storage.get("roots")
+        if not isinstance(roots, list):
+            continue
+        for raw_root in roots:
+            if not isinstance(raw_root, str) or not raw_root.strip():
+                continue
+            path = Path(raw_root.strip())
+            out.add(str(path))
+            try:
+                out.add(str(resolved_path(path)))
+            except Exception:
+                pass
+    return out
+
+
+def discovery_roots(config: dict[str, object]) -> list[Path]:
+    configured = parse_csv_paths(PROJECT_DISCOVERY_ROOTS)
+    if configured:
+        return [path for path in configured if path.exists() and path.is_dir()]
+
+    roots = [Path("/var/www")]
+    for fs in load_mounted_host_filesystems(config):
+        mounted_path = Path(fs["path"])
+        roots.append(mounted_path)
+        roots.append(mounted_path / "www-moved")
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        key = str(resolved_path(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def slug_for_project_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return slug or "project"
+
+
+def discover_untracked_projects(config: dict[str, object]) -> dict[str, object]:
+    known = configured_project_paths(config)
+    candidates: list[dict[str, object]] = []
+    seen_real_paths: set[str] = set()
+
+    for root in discovery_roots(config):
+        try:
+            children = sorted(root.iterdir(), key=lambda item: item.name.lower())
+        except OSError:
+            continue
+
+        for child in children:
+            try:
+                child_exists = child.exists()
+                child_is_dir = child.is_dir()
+            except OSError:
+                continue
+            if not child_exists or not child_is_dir:
+                continue
+            if child.name.startswith(".") or child.name in {"html", "_letsencrypt", "venv", "node_modules"}:
+                continue
+
+            real_child = resolved_path(child)
+            child_key = str(child)
+            real_key = str(real_child)
+            if child_key in known or real_key in known or real_key in seen_real_paths:
+                continue
+            if not is_projectish_dir(real_child):
+                continue
+
+            seen_real_paths.add(real_key)
+            markers = projectish_marker_paths(real_child)
+            candidates.append(
+                {
+                    "id": slug_for_project_name(child.name),
+                    "label": child.name,
+                    "path": child_key,
+                    "real_path": real_key,
+                    "scope": "vps",
+                    "state": "untracked",
+                    "storage_location": storage_location_for_path(child, config),
+                    "marker_paths": markers,
+                    "suggested_tracking": {
+                        "vps_roots": [child_key],
+                        "local_roots": [],
+                        "note": "VPS discovery is host-side. Local MBP tracking needs a local command or committed registry entry.",
+                    },
+                }
+            )
+
+    candidates.sort(key=lambda item: str(item.get("label") or "").lower())
+    return {
+        "scope": "vps",
+        "mode": "host_scan",
+        "root_paths": [str(path) for path in discovery_roots(config)],
+        "candidates": candidates[:24],
+    }
+
+
 def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[str, object]:
     measured_at = iso_utc_now()
     config = load_config()
     projects_payload: dict[str, object] = {}
+    root_residency = root_residency_template()
+    root_project_rows: list[dict[str, object]] = []
+    root_consumer_rows: list[dict[str, object]] = []
+    root_category_totals: dict[str, dict[str, object]] = {}
 
     for project in load_projects(config):
         project_id = str(project.get("id", "")).strip()
@@ -692,6 +1155,13 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
         total_files = 0
         roots_present = 0
         project_buckets: dict[str, dict[str, object]] = {}
+        project_byte_splits: dict[str, int] = {
+            "root_resident_bytes": 0,
+            "mounted_volume_bytes": 0,
+            "symlinked_to_volume_bytes": 0,
+            "other_mount_bytes": 0,
+            "unknown_storage_bytes": 0,
+        }
 
         for root_path in roots:
             root_data = measure_root(root_path, storage)
@@ -699,10 +1169,36 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
             if not root_data.get("exists"):
                 continue
             roots_present += 1
-            total_disk += int(root_data.get("disk_bytes", 0))
+            root_disk_bytes = int(root_data.get("disk_bytes", 0))
+            total_disk += root_disk_bytes
             total_apparent += int(root_data.get("apparent_bytes", 0))
             total_files += int(root_data.get("file_count", 0))
             largest.extend(root_data.get("largest_dirs", []))
+            storage_location = root_data.get("storage_location")
+            storage_class = (
+                str(storage_location.get("class") or "unknown")
+                if isinstance(storage_location, dict)
+                else "unknown"
+            )
+            split_key = storage_byte_key(storage_class)
+            project_byte_splits[split_key] = project_byte_splits.get(split_key, 0) + root_disk_bytes
+            root_residency[split_key] = int(root_residency.get(split_key, 0)) + root_disk_bytes
+            if storage_class in {"mounted_volume", "symlinked_to_volume"}:
+                root_residency["volume_backed_bytes"] = int(root_residency.get("volume_backed_bytes", 0)) + root_disk_bytes
+
+            if storage_class == "root_disk" and root_disk_bytes > 0:
+                root_project_rows.append(
+                    {
+                        "project_id": project_id,
+                        "project_label": str(project.get("label") or project_id),
+                        "path": str(root_data.get("path") or root_path),
+                        "real_path": str(root_data.get("real_path") or root_path),
+                        "bytes": root_disk_bytes,
+                        "storage_class": storage_class,
+                        "storage_label": storage_class_label(storage_class),
+                    }
+                )
+
             raw_buckets = root_data.get("buckets")
             if isinstance(raw_buckets, dict):
                 for bucket_id, raw_bucket in raw_buckets.items():
@@ -713,6 +1209,17 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
                     bucket["apparent_bytes"] = int(bucket.get("apparent_bytes", 0)) + int(raw_bucket.get("apparent_bytes", 0))
                     bucket["file_count"] = int(bucket.get("file_count", 0)) + int(raw_bucket.get("file_count", 0))
                     bucket["match_count"] = int(bucket.get("match_count", 0)) + int(raw_bucket.get("match_count", 0))
+                    if storage_class == "root_disk":
+                        consumer = root_consumer_row(
+                            project_id=project_id,
+                            project_label=str(project.get("label") or project_id),
+                            root_data=root_data,
+                            bucket_id=bucket_id,
+                            bucket=raw_bucket,
+                        )
+                        if consumer is not None:
+                            root_consumer_rows.append(consumer)
+                            add_root_consumer_totals(root_category_totals, consumer)
 
         largest.sort(key=lambda item: int(item.get("disk_bytes", 0)), reverse=True)
 
@@ -729,7 +1236,16 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
                 for bucket_id in BUCKET_ORDER
                 if bucket_id in project_buckets
             },
+            "root_resident_bytes": project_byte_splits.get("root_resident_bytes", 0),
+            "mounted_volume_bytes": project_byte_splits.get("mounted_volume_bytes", 0),
+            "symlinked_to_volume_bytes": project_byte_splits.get("symlinked_to_volume_bytes", 0),
+            "volume_backed_bytes": project_byte_splits.get("mounted_volume_bytes", 0)
+            + project_byte_splits.get("symlinked_to_volume_bytes", 0),
+            "other_mount_bytes": project_byte_splits.get("other_mount_bytes", 0),
         }
+        project_storage_class = storage_class_for_project(project_byte_splits)
+        project_payload["storage_class"] = project_storage_class
+        project_payload["storage_label"] = storage_label_for_project(project_storage_class)
 
         if roots_present > 0:
             project_payload["disk_bytes"] = total_disk
@@ -745,6 +1261,16 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
 
         projects_payload[project_id] = project_payload
 
+    root_project_rows.sort(key=lambda item: int(item.get("bytes", 0)), reverse=True)
+    root_consumer_rows.sort(key=lambda item: int(item.get("bytes", 0)), reverse=True)
+    root_residency["top_root_projects"] = root_project_rows[:TOP_DIR_LIMIT]
+    root_residency["top_consumers"] = root_consumer_rows[: max(TOP_DIR_LIMIT, 8)]
+    root_residency["category_totals"] = sorted(
+        root_category_totals.values(),
+        key=lambda item: int(item.get("bytes", 0)),
+        reverse=True,
+    )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "measured_at": measured_at,
@@ -754,6 +1280,8 @@ def build_snapshot(previous_snapshot: dict[str, object] | None = None) -> dict[s
         "bucket_order": BUCKET_ORDER,
         "host_filesystem": measure_host_filesystem(),
         "mounted_filesystems": measure_mounted_filesystems(config, previous_snapshot),
+        "root_residency": root_residency,
+        "discovery": discover_untracked_projects(config),
         "projects": projects_payload,
     }
 

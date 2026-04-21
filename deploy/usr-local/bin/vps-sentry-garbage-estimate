@@ -1190,6 +1190,8 @@ def run_reclaim(profile: str) -> tuple[int, dict[str, object]]:
         "finished_at": finished_at,
         "freed_bytes_estimated": freed_bytes_estimated,
         "freed_bytes_actual": freed_bytes_actual,
+        "root_available_before_bytes": before_available,
+        "root_available_after_bytes": after_available,
         "deleted_count": deleted_count,
         "buckets": sorted(bucket_rows.values(), key=lambda row: (-int(row["estimated_bytes"]), str(row["label"]))),
         "errors": errors,
