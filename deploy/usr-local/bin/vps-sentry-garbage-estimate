@@ -317,12 +317,16 @@ def service_contexts() -> list[dict[str, object]]:
         path_refs: set[str] = set()
 
         if working_dir and working_dir not in {"-", "(unset)", "n/a"}:
-            path_refs.add(normalize_path_text(working_dir))
+            working_dir_ref = normalize_path_text(working_dir)
+            if path_ref_is_specific(working_dir_ref):
+                path_refs.add(working_dir_ref)
 
         for match in SYSTEMD_PATH_RE.finditer(exec_start):
             path_text = match.group("path").rstrip("),")
             if path_text:
-                path_refs.add(normalize_path_text(path_text))
+                exec_ref = normalize_path_text(path_text)
+                if path_ref_is_specific(exec_ref):
+                    path_refs.add(exec_ref)
 
         if not path_refs:
             continue
@@ -336,6 +340,18 @@ def service_contexts() -> list[dict[str, object]]:
 
     SYSTEMD_SERVICE_CACHE = contexts
     return contexts
+
+
+def path_ref_is_specific(path_text: str) -> bool:
+    if not path_text or path_text == "/":
+        return False
+    try:
+        parts = Path(path_text).parts
+    except TypeError:
+        return False
+    # Ignore broad roots such as /var/www, /home/tony, or the mounted volume root.
+    # Those prove filesystem scope, not ownership of a candidate dependency tree.
+    return len(parts) >= 4
 
 
 def paths_overlap(a: str, b: str) -> bool:
