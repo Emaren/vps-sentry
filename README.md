@@ -39,7 +39,7 @@ Runs on a systemd timer (default: every 5 minutes):
 8. **Actionable public-port intelligence**  
    Detects public listener drift and enriches alerts with PID/unit/exe/cmdline process attribution.
 9. **Publish + normalize pipeline for dashboards**  
-   Generates sanitized `/var/lib/vps-sentry/public/status.json`, computes expected vs unexpected public ports, and publishes `project_storage` host/mounted-volume telemetry for the operator UI.
+   Generates sanitized `/var/lib/vps-sentry/public/status.json`, computes expected vs unexpected public ports, publishes `project_storage` host/mounted-volume telemetry, and exposes safe/guided reclaim candidates for the operator UI.
 10. **Noise controls + memory of seen SSH identities**  
    Uses thresholds, webhook cooldowns, and TTL-based "new SSH accept" memory to reduce repeat spam.
 11. **Dual-channel notifications + evidence shipping**  
@@ -190,6 +190,13 @@ If you see:
 
   * `sudo systemctl start vps-sentry.service`
   * `sudo journalctl -u vps-sentry.service -n 80 --no-pager`
+
+* Root disk is critical but safe reclaim says `0B`
+
+  * Run `sudo /usr/local/bin/vps-sentry-garbage-estimate --force --json` and inspect `guided_reclaimable_bytes`.
+  * `safe_reclaimable_bytes` means the helper can delete those targets with the safe profile.
+  * `guided_reclaimable_bytes` means the helper found large wins, such as root-resident `node_modules`, that need an operator plan before removal.
+  * Guided dependency-tree reclaim should include a service stop, package reinstall, build validation, and rollback path.
 
 * Ship service appears idle or not sending bundles
 

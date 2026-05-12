@@ -37,6 +37,10 @@ JOURNAL_TARGET_BYTES = max(
 BACKUP_KEEP = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP", "5")))
 TOP_PATHS_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_TOP_PATHS_LIMIT", "8")))
 PROGRESS_RECENT_LINES_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_PROGRESS_LINES", "6")))
+GUIDED_NODE_MODULES_MIN_BYTES = max(
+    0, int(os.environ.get("VPS_SENTRY_GARBAGE_GUIDED_NODE_MODULES_MIN_BYTES", str(250 * 1024 * 1024)))
+)
+GUIDED_NODE_MODULES_LIMIT = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_GUIDED_NODE_MODULES_LIMIT", "8")))
 PROJECTS_JSON = Path(os.environ.get("VPS_SENTRY_PROJECTS_JSON", "/etc/vps-sentry-projects.json"))
 HOST_PROJECT_ID = os.environ.get("VPS_SENTRY_GARBAGE_HOST_PROJECT_ID", "vps-host")
 SCHEMA_VERSION = 2
@@ -548,6 +552,25 @@ def find_paths(root: Path, pattern: str, path_type: str) -> list[Path]:
     return out
 
 
+def find_named_dirs_pruned(root: Path, name: str) -> list[Path]:
+    try:
+        completed = subprocess.run(
+            ["find", str(root), "-xdev", "-type", "d", "-name", name, "-prune", "-print"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+
+    out: list[Path] = []
+    for line in completed.stdout.splitlines():
+        raw = line.strip()
+        if raw:
+            out.append(Path(raw))
+    return out
+
+
 def scan_next_cache_dirs() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for root in scan_roots():
@@ -569,6 +592,36 @@ def scan_next_cache_dirs() -> list[dict[str, object]]:
                 )
             )
     return out
+
+
+def scan_guided_node_modules() -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for root in scan_roots():
+        for path in find_named_dirs_pruned(root, "node_modules"):
+            bytes_value = path_disk_bytes(path)
+            if bytes_value < GUIDED_NODE_MODULES_MIN_BYTES:
+                continue
+            out.append(
+                candidate(
+                    key="guided_node_modules",
+                    label="Large dependency trees",
+                    path=path,
+                    bytes_value=bytes_value,
+                    action="guided_review",
+                    kind="directory",
+                    category="guided",
+                    risk="guided",
+                    explanation=(
+                        "Large dependency tree on the root filesystem. Reclaim only with a deliberate "
+                        "service stop, package reinstall, and build/rollback plan."
+                    ),
+                    regrows=True,
+                    requires_stop=True,
+                )
+            )
+
+    out.sort(key=lambda item: (-int(item.get("bytes") or 0), str(item.get("path") or "")))
+    return out[:GUIDED_NODE_MODULES_LIMIT]
 
 
 def scan_vscode_old_bins() -> list[dict[str, object]]:
@@ -784,6 +837,7 @@ def collect_candidates() -> list[dict[str, object]]:
         + scan_apt_cache()
         + scan_journal_excess()
         + scan_backup_retention()
+        + scan_guided_node_modules()
     )
 
 
