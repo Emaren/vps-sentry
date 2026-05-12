@@ -39,7 +39,7 @@ Runs on a systemd timer (default: every 5 minutes):
 8. **Actionable public-port intelligence**  
    Detects public listener drift and enriches alerts with PID/unit/exe/cmdline process attribution.
 9. **Publish + normalize pipeline for dashboards**  
-   Generates sanitized `/var/lib/vps-sentry/public/status.json`, computes expected vs unexpected public ports, publishes `project_storage` host/mounted-volume telemetry, and exposes safe/guided reclaim candidates for the operator UI.
+   Generates sanitized `/var/lib/vps-sentry/public/status.json`, computes expected vs unexpected public ports, publishes `project_storage` host/mounted-volume telemetry, and exposes safe/guided reclaim candidates for the operator UI. Guided dependency candidates are enriched with systemd service refs when a unit working directory or `ExecStart` path overlaps the candidate path.
 10. **Noise controls + memory of seen SSH identities**  
    Uses thresholds, webhook cooldowns, and TTL-based "new SSH accept" memory to reduce repeat spam.
 11. **Dual-channel notifications + evidence shipping**  
@@ -196,6 +196,7 @@ If you see:
   * Run `sudo /usr/local/bin/vps-sentry-garbage-estimate --force --json` and inspect `guided_reclaimable_bytes`.
   * `safe_reclaimable_bytes` means the helper can delete those targets with the safe profile.
   * `guided_reclaimable_bytes` means the helper found large wins, such as root-resident `node_modules`, that need an operator plan before removal.
+  * `service_refs` on guided candidates are inferred only when the registry or live systemd unit paths prove the relationship.
   * Guided dependency-tree reclaim should include a service stop, package reinstall, build validation, and rollback path.
 
 * Ship service appears idle or not sending bundles

@@ -101,6 +101,7 @@ TMP_NAME_EXACT = {
     "node-compile-cache",
 }
 EXTENSION_VERSION_RE = re.compile(r"^(?P<base>.+)-(?P<version>\d[\w.+-]*)$")
+SYSTEMD_PATH_RE = re.compile(r"(?P<path>/(?:var/www|mnt|home|opt|srv)/[^\s;\"']+)")
 
 PACKAGE_CACHE_SUFFIXES = (
     ".npm",
@@ -113,6 +114,7 @@ PACKAGE_CACHE_SUFFIXES = (
 )
 
 PROJECT_REGISTRY_CACHE: list[dict[str, object]] | None = None
+SYSTEMD_SERVICE_CACHE: list[dict[str, object]] | None = None
 
 
 def log(message: str) -> None:
@@ -255,6 +257,110 @@ def load_project_registry() -> list[dict[str, object]]:
 
     PROJECT_REGISTRY_CACHE = projects
     return projects
+
+
+def systemd_service_names() -> list[str]:
+    names: set[str] = set()
+    commands = [
+        ["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"],
+        ["systemctl", "list-unit-files", "--type=service", "--no-legend", "--no-pager"],
+    ]
+    for command in commands:
+        try:
+            completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        for line in completed.stdout.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            name = parts[0].strip()
+            if not name.endswith(".service"):
+                continue
+            if name.startswith("vps-sentry-unit-event@"):
+                continue
+            names.add(name)
+    return sorted(names)
+
+
+def systemd_show(unit: str) -> dict[str, str]:
+    try:
+        completed = subprocess.run(
+            ["systemctl", "show", unit, "-p", "Id", "-p", "WorkingDirectory", "-p", "ExecStart", "--no-pager"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+
+    out: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        out[key.strip()] = value.strip()
+    return out
+
+
+def service_contexts() -> list[dict[str, object]]:
+    global SYSTEMD_SERVICE_CACHE
+    if SYSTEMD_SERVICE_CACHE is not None:
+        return SYSTEMD_SERVICE_CACHE
+
+    contexts: list[dict[str, object]] = []
+    for unit in systemd_service_names():
+        info = systemd_show(unit)
+        unit_id = info.get("Id") or unit
+        working_dir = info.get("WorkingDirectory") or ""
+        exec_start = info.get("ExecStart") or ""
+        path_refs: set[str] = set()
+
+        if working_dir and working_dir not in {"-", "(unset)", "n/a"}:
+            path_refs.add(normalize_path_text(working_dir))
+
+        for match in SYSTEMD_PATH_RE.finditer(exec_start):
+            path_text = match.group("path").rstrip("),")
+            if path_text:
+                path_refs.add(normalize_path_text(path_text))
+
+        if not path_refs:
+            continue
+
+        contexts.append(
+            {
+                "unit": unit_id,
+                "path_refs": sorted(path_refs, key=len, reverse=True),
+            }
+        )
+
+    SYSTEMD_SERVICE_CACHE = contexts
+    return contexts
+
+
+def paths_overlap(a: str, b: str) -> bool:
+    left = a.rstrip("/")
+    right = b.rstrip("/")
+    return left == right or left.startswith(f"{right}/") or right.startswith(f"{left}/")
+
+
+def infer_service_refs_for_path(path: Path | str) -> list[str]:
+    path_text = normalize_path_text(path)
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    for context in service_contexts():
+        unit = str(context.get("unit") or "").strip()
+        if not unit or unit in seen:
+            continue
+        raw_refs = context.get("path_refs")
+        if not isinstance(raw_refs, list):
+            continue
+        if any(isinstance(ref, str) and paths_overlap(path_text, ref) for ref in raw_refs):
+            refs.append(unit)
+            seen.add(unit)
+
+    return refs
 
 
 def fallback_host_project() -> dict[str, object] | None:
@@ -467,6 +573,15 @@ def candidate(
     path_text = str(path_obj)
     candidate_id = f"{action}:{path_obj.resolve() if path_obj.exists() else path_text}"
     project_context = project_context_for_path(path_obj)
+    service_refs: list[str] = []
+    if project_context:
+        for ref in project_context.get("service_refs", []):
+            if isinstance(ref, str) and ref.strip() and ref.strip() not in service_refs:
+                service_refs.append(ref.strip())
+    if requires_stop:
+        for ref in infer_service_refs_for_path(path_obj):
+            if ref not in service_refs:
+                service_refs.append(ref)
     execute_command = execute_command_for(action, path_text)
     payload = {
         "id": candidate_id,
@@ -487,7 +602,9 @@ def candidate(
         "execute_command": execute_command,
     }
     if project_context:
-        payload.update(project_context)
+        payload.update({key: value for key, value in project_context.items() if key != "service_refs"})
+    if service_refs:
+        payload["service_refs"] = service_refs
     return payload
 
 
