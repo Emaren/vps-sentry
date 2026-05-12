@@ -198,6 +198,7 @@ If you see:
   * `guided_reclaimable_bytes` means the helper found large wins, such as root-resident `node_modules`, that need an operator plan before removal.
   * `service_refs` on guided candidates are inferred only when the registry or live systemd unit paths prove the relationship.
   * Guided dependency-tree reclaim should include a service stop, package reinstall, build validation, and rollback path.
+  * For the May 2026 root-pressure rescue, `scripts/vps-guided-disk-rescue.sh` contains the audited operator path used to quarantine `cpu-logind`, run safe reclaim, and move selected root-backed dependency trees onto the mounted volume with symlinks. It is intentionally explicit about service stops/starts and should be edited deliberately before reuse on a different host.
 
 * Ship service appears idle or not sending bundles
 

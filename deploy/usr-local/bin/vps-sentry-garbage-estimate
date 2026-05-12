@@ -1390,10 +1390,12 @@ def run_reclaim(profile: str) -> tuple[int, dict[str, object]]:
     except Exception:
         pass
 
-    snapshot = summarize_candidates(collect_candidates(), result)
+    cleanup_summary = dict(result)
+    snapshot = summarize_candidates(collect_candidates(), cleanup_summary)
     publish_snapshot(snapshot)
-    result["estimate"] = snapshot
-    return (0 if result["ok"] else 1), result
+    response = dict(result)
+    response["estimate"] = snapshot
+    return (0 if result["ok"] else 1), response
 
 
 def acquire_lock(nonblocking: bool):
