@@ -1519,6 +1519,11 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
         if not reasons:
             continue
 
+        runtime_path = temp_exec_root_for_path(exe) or temp_exec_root_for_path(cwd)
+        hardening = temp_exec_hardening_state(unit, runtime_path) if unit and runtime_path else None
+        if hardening and hardening.get("status") == "gap":
+            reasons.append(str(hardening.get("detail") or "owning service temp path is executable"))
+
         ident = f"{comm} {exe} {cmdline}"
         if any(r.search(ident) for r in allow_re):
             continue
@@ -1542,6 +1547,8 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
             "cmdline": clamp(cmdline, 240),
             "reasons": uniq_reasons,
         }
+        if hardening:
+            item["temp_exec_hardening"] = hardening
         if ob:
             item["outbound"] = {
                 "connections": int(ob.get("connections", 0) or 0),
@@ -1554,6 +1561,70 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
 
     hits.sort(key=lambda x: (len(x.get("reasons", [])), int(x.get("pid", 0))), reverse=True)
     return hits[:max_hits]
+
+
+TEMP_EXEC_PATHS = ("/tmp", "/var/tmp", "/dev/shm", "/run")
+SYSTEMD_UNIT_TEXT_CACHE: Dict[str, str | None] = {}
+
+
+def temp_exec_root_for_path(path_value: str | None) -> str | None:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return None
+    for root in TEMP_EXEC_PATHS:
+        if path_text == root or path_text.startswith(root + "/"):
+            return root
+    return None
+
+
+def systemd_unit_text(unit: str) -> str | None:
+    unit_name = str(unit or "").strip()
+    if not unit_name or "/" in unit_name:
+        return None
+    if unit_name in SYSTEMD_UNIT_TEXT_CACHE:
+        return SYSTEMD_UNIT_TEXT_CACHE[unit_name]
+    rc, out = run_cmd(["systemctl", "cat", unit_name], timeout=10)
+    value = out if rc == 0 and out else None
+    SYSTEMD_UNIT_TEXT_CACHE[unit_name] = value
+    return value
+
+
+def unit_temp_path_noexec(unit: str, runtime_path: str) -> bool | None:
+    text = systemd_unit_text(unit)
+    if text is None:
+        return None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or not line.startswith("TemporaryFileSystem="):
+            continue
+        value = line.split("=", 1)[1].strip()
+        mount, _, opts = value.partition(":")
+        mount = mount.rstrip("/") or "/"
+        if mount != runtime_path.rstrip("/"):
+            continue
+        options = {item.strip().lower() for item in opts.split(",") if item.strip()}
+        return "noexec" in options
+    return False
+
+
+def temp_exec_hardening_state(unit: str, runtime_path: str) -> Dict[str, Any] | None:
+    noexec = unit_temp_path_noexec(unit, runtime_path)
+    if noexec is None:
+        status = "unknown"
+        detail = f"{unit} hardening could not be read."
+    elif noexec:
+        status = "protected"
+        detail = f"{unit} mounts {runtime_path} noexec."
+    else:
+        status = "gap"
+        detail = f"{unit} does not mount {runtime_path} noexec."
+    return {
+        "unit": unit,
+        "runtime_path": runtime_path,
+        "noexec": noexec,
+        "status": status,
+        "detail": detail,
+    }
 
 
 def _build_outbound_ioc_detail(hits: List[Dict[str, Any]]) -> str:
@@ -1595,6 +1666,13 @@ def _build_process_ioc_detail(hits: List[Dict[str, Any]]) -> str:
         unit = str(h.get("unit", "") or "")
         if unit:
             lines.append(f"  unit={unit}")
+        hardening = h.get("temp_exec_hardening")
+        if isinstance(hardening, dict):
+            status = str(hardening.get("status") or "unknown")
+            runtime_path = str(hardening.get("runtime_path") or "")
+            detail = str(hardening.get("detail") or "").strip()
+            suffix = f" ({detail})" if detail else ""
+            lines.append(f"  temp_exec_hardening={status} path={runtime_path}{suffix}")
         reasons = h.get("reasons", []) or []
         if reasons:
             lines.append("  reasons: " + "; ".join([str(x) for x in reasons[:4]]))
