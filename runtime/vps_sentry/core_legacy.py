@@ -1506,16 +1506,18 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
             elif ob:
                 reasons.append(f"process with public outbound connection executing from user-writable path ({argv0})")
 
-        # No signal yet, skip expensive /proc reads.
-        if not reasons:
-            continue
-
         ex = proc_explain(pid)
         exe = ex.get("exe", "") or ""
+        cwd = ex.get("cwd", "") or ""
         unit = ex.get("unit", "") or ""
         cmdline = ex.get("cmdline", "") or args
         if exe and any(r.search(exe) for r in exe_re):
             reasons.append("executable path is in suspicious writable runtime path")
+        elif argv0 and not argv0.startswith("/") and cwd and any(r.search(f"{cwd.rstrip('/')}/") for r in exe_re):
+            reasons.append(f"relative executable launched from suspicious writable runtime cwd ({cwd})")
+
+        if not reasons:
+            continue
 
         ident = f"{comm} {exe} {cmdline}"
         if any(r.search(ident) for r in allow_re):
