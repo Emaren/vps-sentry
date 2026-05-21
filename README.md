@@ -25,7 +25,7 @@ Runs on a systemd timer (default: every 5 minutes):
 1. **Critical runtime IOC detection**  
    Detects high-fanout outbound scan behavior and suspicious process IOC patterns, then raises immediate `critical` alerts.
    The process classifier resolves `/proc/<pid>/exe` before dropping low-CPU rows so relative commands launched from `/tmp`, `/var/tmp`, `/dev/shm`, or `/run` still surface as runtime IOCs.
-   When the owning systemd unit is known, IOC details include whether that service mounts the abused temp path with `noexec`.
+   When the owning systemd unit is known, IOC details compare the unit's declared temp-path hardening with the live `/proc/<pid>/mountinfo` namespace, so config that says `noexec` but is not actually active is reported as ineffective instead of protected. Counterstrike also preserves `/proc/<pid>/exe` and `mountinfo` before killing a process, which keeps evidence available even when the executable was deleted or hidden behind a private temp namespace.
 2. **Threat telemetry for UI/API**  
    Publishes structured `threat` data (`suspicious_processes`, `outbound_suspicious`, `persistence_hits`, `indicators`) into `status.json`.
 3. **Wide host drift coverage in one agent**  

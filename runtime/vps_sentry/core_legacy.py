@@ -1520,8 +1520,8 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
             continue
 
         runtime_path = temp_exec_root_for_path(exe) or temp_exec_root_for_path(cwd)
-        hardening = temp_exec_hardening_state(unit, runtime_path) if unit and runtime_path else None
-        if hardening and hardening.get("status") == "gap":
+        hardening = temp_exec_hardening_state(unit, runtime_path, pid) if unit and runtime_path else None
+        if hardening and hardening.get("status") in ("gap", "ineffective"):
             reasons.append(str(hardening.get("detail") or "owning service temp path is executable"))
 
         ident = f"{comm} {exe} {cmdline}"
@@ -1607,23 +1607,99 @@ def unit_temp_path_noexec(unit: str, runtime_path: str) -> bool | None:
     return False
 
 
-def temp_exec_hardening_state(unit: str, runtime_path: str) -> Dict[str, Any] | None:
-    noexec = unit_temp_path_noexec(unit, runtime_path)
-    if noexec is None:
+def _decode_mountinfo_path(value: str) -> str:
+    return (
+        str(value or "")
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+
+
+def _parse_mountinfo_for_path(raw: str, runtime_path: str) -> Dict[str, Any] | None:
+    target_path = (runtime_path or "").rstrip("/") or "/"
+    for line in (raw or "").splitlines():
+        pre, sep, post = line.partition(" - ")
+        if not sep:
+            continue
+        fields = pre.split()
+        post_fields = post.split()
+        if len(fields) < 6 or len(post_fields) < 3:
+            continue
+        mount_point = _decode_mountinfo_path(fields[4]).rstrip("/") or "/"
+        if mount_point != target_path:
+            continue
+        options = {item.strip().lower() for item in fields[5].split(",") if item.strip()}
+        super_options = {item.strip().lower() for item in post_fields[2].split(",") if item.strip()}
+        combined = sorted(options | super_options)
+        return {
+            "mount_point": mount_point,
+            "fstype": post_fields[0],
+            "source": post_fields[1],
+            "options": combined,
+            "noexec": "noexec" in options or "noexec" in super_options,
+        }
+    return None
+
+
+def proc_temp_path_noexec(pid: int, runtime_path: str) -> Dict[str, Any] | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "mountinfo").read_text(errors="replace")
+    except Exception:
+        return None
+    return _parse_mountinfo_for_path(raw, runtime_path)
+
+
+def temp_exec_hardening_state(unit: str, runtime_path: str, pid: int | None = None) -> Dict[str, Any] | None:
+    configured_noexec = unit_temp_path_noexec(unit, runtime_path)
+    actual = proc_temp_path_noexec(pid, runtime_path) if pid else None
+    actual_noexec = actual.get("noexec") if actual else None
+
+    if actual_noexec is True:
+        status = "protected"
+        detail = f"{unit} has {runtime_path} mounted noexec in the live process namespace."
+        noexec = True
+    elif actual_noexec is False and configured_noexec is True:
+        status = "ineffective"
+        detail = (
+            f"{unit} declares {runtime_path} noexec, but the live process namespace is executable "
+            f"({','.join(actual.get('options', [])) or 'no options reported'})."
+        )
+        noexec = False
+    elif actual_noexec is False:
+        status = "gap"
+        detail = f"{unit} has {runtime_path} mounted without noexec in the live process namespace."
+        noexec = False
+    elif configured_noexec is None:
         status = "unknown"
         detail = f"{unit} hardening could not be read."
-    elif noexec:
-        status = "protected"
-        detail = f"{unit} mounts {runtime_path} noexec."
+        noexec = None
+    elif configured_noexec:
+        status = "configured"
+        detail = f"{unit} declares {runtime_path} noexec, but the live mount namespace could not be verified."
+        noexec = True
     else:
         status = "gap"
         detail = f"{unit} does not mount {runtime_path} noexec."
-    return {
+        noexec = False
+
+    payload: Dict[str, Any] = {
         "unit": unit,
         "runtime_path": runtime_path,
         "noexec": noexec,
+        "configured_noexec": configured_noexec,
+        "actual_noexec": actual_noexec,
         "status": status,
         "detail": detail,
+    }
+    if actual:
+        payload["mount_point"] = actual.get("mount_point")
+        payload["mount_fstype"] = actual.get("fstype")
+        payload["mount_source"] = actual.get("source")
+        payload["mount_options"] = actual.get("options")
+    return {
+        **payload,
     }
 
 

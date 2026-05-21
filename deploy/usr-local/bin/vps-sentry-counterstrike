@@ -697,7 +697,7 @@ def capture_process_evidence(candidate: Candidate, evidence_dir: Path, progress:
     (proc_dir / f"ps-{candidate.pid}.txt").write_text(ps_out.stdout or ps_out.stderr or "", encoding="utf-8")
 
     proc_root = Path("/proc") / str(candidate.pid)
-    for proc_file in ("status", "cmdline", "environ"):
+    for proc_file in ("status", "cmdline", "environ", "mountinfo"):
         source = proc_root / proc_file
         target = proc_dir / f"{proc_file}-{candidate.pid}.txt"
         try:
@@ -711,6 +711,29 @@ def capture_process_evidence(candidate: Candidate, evidence_dir: Path, progress:
                 shutil.copy2(source, target)
         except Exception:
             continue
+
+    exe_link = proc_root / "exe"
+    try:
+        exe_target = os.readlink(exe_link)
+    except Exception:
+        exe_target = candidate.exe
+    exe_name = sanitize_slug(Path(candidate.proc or candidate.exe or f"pid-{candidate.pid}").name)
+    exe_copy = proc_dir / f"exe-{candidate.pid}-{exe_name}"
+    try:
+        shutil.copy2(exe_link, exe_copy)
+        digest = sha256_file(exe_copy)
+        metadata = {
+            "pid": candidate.pid,
+            "proc": candidate.proc,
+            "reported_exe": candidate.exe,
+            "proc_exe_target": exe_target,
+            "evidence_path": str(exe_copy),
+            "sha256": digest,
+        }
+        write_json(proc_dir / f"exe-{candidate.pid}-{exe_name}.json", metadata)
+        progress.append(f"Process executable evidence saved: {exe_copy}")
+    except Exception as err:
+        progress.append(f"Process executable evidence unavailable for pid {candidate.pid}: {err}")
 
 
 def quarantine_executable(candidate: Candidate, evidence_dir: Path, progress: Progress) -> tuple[bool, str | None, str]:
