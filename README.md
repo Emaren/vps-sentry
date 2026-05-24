@@ -302,6 +302,14 @@ Mounted volume telemetry:
   * `project_storage.root_residency` summarizes root-resident project mass and top root consumers by reclaim posture category
 * VPS-side discovery is host-side only. `project_storage.discovery.candidates[]` reports likely untracked project roots found under `/var/www` and configured mounted-volume project roots. Local MBP project discovery must come from local command-driven tooling or a committed registry entry; the web UI must not pretend the browser can inspect arbitrary local folders.
 
+Current production storage notes:
+
+* Root filesystem pressure remains the main deploy risk; the mounted volume is `/mnt/HC_Volume_105319120`.
+* The active HD AoE2 app is surfaced as `AoE2War` at `aoe2war.com`, while the historical repo/service path remains `/var/www/AoE2HDBets` with `aoe2hdbets-*` units.
+* VPSSentry hourly app backups now preserve the cron-facing path `/home/tony/_backup/vps-sentry-web` as a symlink to `/mnt/HC_Volume_105319120/root-archive/vps-sentry-web-backups`.
+* The May 24, 2026 storage pass moved only that backup sink after verifying `1818` files / `1,282,162,535` bytes; it did not move or delete DBs, chain state, WoloChain settlement/operator state, live downloads, or production dependency trees.
+* After safe cache/log cleanup, backup relocation, rebuild, restart, and a fresh scan, root was about `64-65%` used with `13-14G` free and the mounted volume was about `77%` used with `12G` free.
+
 Signing key material:
 
 * Ship service default: `/var/lib/vps-sentry/keys/evidence_signing_key.pem` + `/var/lib/vps-sentry/keys/evidence_signing_pub.pem`

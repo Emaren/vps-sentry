@@ -49,8 +49,8 @@
     },
     {
       "id": "aoe2hdbets",
-      "label": "AoE2HDBets",
-      "public_url": "https://aoe2hdbets.com",
+      "label": "AoE2War",
+      "public_url": "https://aoe2war.com",
       "storage": {
         "roots": [
           "/var/www/AoE2HDBets"
