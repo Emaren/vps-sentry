@@ -102,6 +102,11 @@ TMP_NAME_EXACT = {
 }
 EXTENSION_VERSION_RE = re.compile(r"^(?P<base>.+)-(?P<version>\d[\w.+-]*)$")
 SYSTEMD_PATH_RE = re.compile(r"(?P<path>/(?:var/www|mnt|home|opt|srv)/[^\s;\"']+)")
+VSCODE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+VSCODE_PROCESS_COMMIT_RE = re.compile(
+    r"(?:^|/)(?:code-|Stable-)?(?P<commit>[0-9a-f]{40})(?:\b|/)",
+    re.IGNORECASE,
+)
 
 PACKAGE_CACHE_SUFFIXES = (
     ".npm",
@@ -390,6 +395,7 @@ def project_context_for_path(path: Path | str) -> dict[str, object] | None:
     path_text = normalize_path_text(path)
     best_match: dict[str, object] | None = None
     best_match_len = -1
+    is_host_fallback = False
 
     for project in load_project_registry():
         for root in project.get("storage_roots", []):
@@ -415,15 +421,20 @@ def project_context_for_path(path: Path | str) -> dict[str, object] | None:
             or "/.vscode-server/" in path_text
         ):
             target = host_project
+            is_host_fallback = True
 
     if target is None:
         return None
+
+    service_refs = []
+    if not is_host_fallback:
+        service_refs = [ref for ref in target.get("service_refs", []) if isinstance(ref, str) and ref.strip()]
 
     out = {
         "project_id": str(target.get("id") or "").strip() or None,
         "project_label": str(target.get("label") or "").strip() or None,
         "project_url": str(target.get("public_url") or "").strip() or None,
-        "service_refs": [ref for ref in target.get("service_refs", []) if isinstance(ref, str) and ref.strip()],
+        "service_refs": service_refs,
     }
     return out
 
@@ -731,6 +742,8 @@ def scan_guided_node_modules() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     for root in scan_roots():
         for path in find_named_dirs_pruned(root, "node_modules"):
+            if "/.vscode-server/" in str(path):
+                continue
             bytes_value = path_disk_bytes(path)
             if bytes_value < GUIDED_NODE_MODULES_MIN_BYTES:
                 continue
@@ -759,31 +772,85 @@ def scan_guided_node_modules() -> list[dict[str, object]]:
 
 def scan_vscode_old_bins() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
+    active_commits = active_vscode_server_commits()
     for home in home_roots():
-        bin_root = home / ".vscode-server" / "bin"
-        if not bin_root.is_dir():
+        out.extend(scan_vscode_version_root(home / ".vscode-server" / "bin", active_commits))
+        out.extend(scan_vscode_version_root(home / ".vscode-server" / "cli" / "servers", active_commits))
+    return out
+
+
+def vscode_commit_for_version_dir(path: Path) -> str | None:
+    name = path.name
+    if name.startswith("Stable-"):
+        name = name.removeprefix("Stable-")
+    if VSCODE_COMMIT_RE.match(name):
+        return name.lower()
+    return None
+
+
+def active_vscode_server_commits() -> set[str]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-eo", "args="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+
+    commits: set[str] = set()
+    for line in completed.stdout.splitlines():
+        if ".vscode-server" not in line:
             continue
-        versions = [child for child in bin_root.iterdir() if child.is_dir() and not child.is_symlink()]
-        if len(versions) <= 1:
+        for match in VSCODE_PROCESS_COMMIT_RE.finditer(line):
+            commits.add(match.group("commit").lower())
+    return commits
+
+
+def scan_vscode_version_root(version_root: Path, active_commits: set[str]) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    if not version_root.is_dir():
+        return out
+
+    versions = [
+        child
+        for child in version_root.iterdir()
+        if child.is_dir() and not child.is_symlink() and vscode_commit_for_version_dir(child)
+    ]
+    if not versions:
+        return out
+
+    versions.sort(key=lambda item: item.stat(follow_symlinks=False).st_mtime, reverse=True)
+    keep_commits = set(active_commits)
+    if not keep_commits and versions:
+        newest = vscode_commit_for_version_dir(versions[0])
+        if newest:
+            keep_commits.add(newest)
+
+    for old in versions:
+        commit = vscode_commit_for_version_dir(old)
+        if commit and commit in keep_commits:
             continue
-        versions.sort(key=lambda item: item.stat(follow_symlinks=False).st_mtime, reverse=True)
-        for old in versions[1:]:
-            bytes_value = path_disk_bytes(old)
-            if bytes_value <= 0:
-                continue
-            out.append(
-                candidate(
-                    key="vscode_old",
-                    label="Old VS Code server versions",
-                    path=old,
-                    bytes_value=bytes_value,
-                    action="remove_path",
-                    kind="path",
-                    category="recycling",
-                    explanation="Older VS Code remote-server builds that can be reinstalled if needed.",
-                    regrows=True,
-                )
+        bytes_value = path_disk_bytes(old)
+        if bytes_value <= 0:
+            continue
+        out.append(
+            candidate(
+                key="vscode_old",
+                label="Inactive VS Code server builds",
+                path=old,
+                bytes_value=bytes_value,
+                action="remove_path",
+                kind="path",
+                category="recycling",
+                explanation=(
+                    "Inactive VS Code remote-server build. Active server commits are kept; "
+                    "removed builds can be reinstalled by VS Code if needed."
+                ),
+                regrows=True,
             )
+        )
     return out
 
 

@@ -58,6 +58,78 @@
       }
     },
     {
+      "id": "ascendai",
+      "label": "AscendAI",
+      "public_url": "https://ascendai.one",
+      "domains": [
+        "ascendai.one",
+        "www.ascendai.one"
+      ],
+      "storage": {
+        "roots": [
+          "/var/www/AscendAI",
+          "/mnt/HC_Volume_105319120/www-moved/AscendAI"
+        ]
+      },
+      "services": [
+        {
+          "unit": "ascendai-web.service",
+          "label": "AscendAI public web",
+          "domain": "ascendai.one",
+          "health_urls": [
+            "https://ascendai.one",
+            "http://127.0.0.1:3070"
+          ],
+          "impact": "The AscendAI public intake and proof-of-work surface at ascendai.one is unavailable until the web service returns.",
+          "runbook": "systemctl status ascendai-web.service --no-pager -l && journalctl -u ascendai-web.service -n 80 --no-pager",
+          "open_title": "AscendAI web inactive",
+          "recovery_title": "AscendAI web restored",
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "id": "usetab-ca",
+      "label": "UseTab.ca",
+      "public_url": "https://usetab.ca",
+      "domains": [
+        "usetab.ca",
+        "www.usetab.ca"
+      ],
+      "storage": {
+        "roots": [
+          "/var/www/UseTab",
+          "/mnt/HC_Volume_105319120/www-moved/UseTab"
+        ]
+      },
+      "services": [
+        {
+          "unit": "usetab-ca.service",
+          "label": "UseTab public web",
+          "domain": "usetab.ca",
+          "health_urls": [
+            "https://usetab.ca",
+            "http://127.0.0.1:3080"
+          ],
+          "impact": "The UseTab public borrower/backer intake surface is unavailable until the web service returns.",
+          "runbook": "systemctl status usetab-ca.service --no-pager -l && journalctl -u usetab-ca.service -n 80 --no-pager",
+          "open_title": "UseTab.ca web inactive",
+          "recovery_title": "UseTab.ca web restored",
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "id": "creditchain",
+      "label": "CreditChain",
+      "public_url": "https://chain.usetab.ca",
+      "domains": [
+        "chain.usetab.ca",
+        "chain.ascendai.one"
+      ],
+      "state": "dormant"
+    },
+    {
       "id": "aoe2dewarwagers",
       "label": "AoE2DEWarWagers",
       "public_url": "https://aoe2dewarwagers.com",
