@@ -36,6 +36,12 @@ JOURNAL_TARGET_BYTES = max(
 )
 BACKUP_KEEP = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP", "5")))
 BACKUP_KEEP_DAYS = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP_DAYS", "14")))
+VOLUME_ARCHIVE_MIN_BYTES = max(
+    0, int(os.environ.get("VPS_SENTRY_GARBAGE_VOLUME_ARCHIVE_MIN_BYTES", str(64 * 1024 * 1024)))
+)
+VOLUME_RELOCATED_BACKUP_MIN_AGE_DAYS = max(
+    1, int(os.environ.get("VPS_SENTRY_GARBAGE_VOLUME_RELOCATED_BACKUP_MIN_AGE_DAYS", "30"))
+)
 TOP_PATHS_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_TOP_PATHS_LIMIT", "8")))
 PROGRESS_RECENT_LINES_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_PROGRESS_LINES", "6")))
 GUIDED_NODE_MODULES_MIN_BYTES = max(
@@ -182,6 +188,39 @@ def scan_roots() -> list[Path]:
 def backup_roots() -> list[Path]:
     configured = parse_csv_paths(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_DIRS"))
     roots = configured or [Path("/home/tony/_backup/vps-sentry-web")]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved = root
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+def mounted_volume_roots() -> list[Path]:
+    configured = parse_csv_paths(os.environ.get("VPS_SENTRY_GARBAGE_VOLUME_ROOTS"))
+    roots = configured
+    if not roots:
+        payload = load_json(PROJECTS_JSON) or {}
+        host_filesystems = payload.get("host_filesystems")
+        if isinstance(host_filesystems, list):
+            for entry in host_filesystems:
+                if not isinstance(entry, dict):
+                    continue
+                path = entry.get("path")
+                if isinstance(path, str) and path.strip():
+                    roots.append(Path(path.strip()))
+    if not roots:
+        roots = [Path("/mnt/HC_Volume_105319120")]
+
     out: list[Path] = []
     seen: set[str] = set()
     for root in roots:
@@ -1065,6 +1104,162 @@ def scan_backup_retention() -> list[dict[str, object]]:
     return out
 
 
+def live_symlink_targets() -> set[str]:
+    roots = [root for root in (Path("/var/www"), Path("/home")) if root.exists()]
+    if not roots:
+        return set()
+    command = ["find", *[str(root) for root in roots], "-xdev", "-type", "l", "-printf", "%p\t%l\n"]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+
+    targets: set[str] = set()
+    for line in completed.stdout.splitlines():
+        source_text, sep, target_text = line.partition("\t")
+        if not sep or not target_text.startswith("/"):
+            continue
+        source = Path(source_text)
+        target = Path(target_text)
+        try:
+            resolved = target.resolve()
+        except OSError:
+            resolved = target
+        targets.add(str(resolved))
+        if source.name == "node_modules":
+            targets.add(str(resolved.parent))
+    return targets
+
+
+def overlaps_live_symlink_target(path: Path, live_targets: set[str]) -> bool:
+    if not live_targets:
+        return False
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    return any(paths_overlap(str(resolved), target) for target in live_targets)
+
+
+def protected_volume_archive_path(path: Path) -> bool:
+    lowered = str(path).lower()
+    protected_fragments = (
+        "/guided-node-modules",
+        "/www-moved",
+        "/traffic-db",
+        "/aoe2hdbets-trace",
+        "/aoe2-downloads",
+        "/aoe2de-downloads",
+        "/wolochain",
+        "wolochain-settlement",
+        "settlement-state",
+        "settlement-backups",
+        "/docker",
+    )
+    return any(fragment in lowered for fragment in protected_fragments)
+
+
+def is_vpssentry_backup_copy(path: Path) -> bool:
+    lowered = str(path).lower()
+    name = path.name.lower()
+    if "wolochain" in lowered or "settlement" in lowered:
+        return False
+    if "vps-sentry-web" in name and ("_backup" in lowered or "backup" in lowered):
+        return True
+    if name.startswith("home-tony-_backup-") and (path / "vps-sentry-web").is_dir():
+        return True
+    return False
+
+
+def relocated_archive_children(root: Path) -> list[Path]:
+    relocated = root / "_relocated"
+    if not relocated.is_dir():
+        return []
+    children: list[Path] = []
+    for child in sorted(relocated.iterdir()):
+        if not child.is_dir() or child.is_symlink():
+            continue
+        if re.match(r"^\d{8}-\d{6}$", child.name):
+            for grandchild in sorted(child.iterdir()):
+                if grandchild.is_dir() and not grandchild.is_symlink():
+                    children.append(grandchild)
+            continue
+        children.append(child)
+    return children
+
+
+def volume_archive_roots(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for name in ("_archive", "root-archive"):
+        archive_root = root / name
+        if not archive_root.is_dir():
+            continue
+        for child in sorted(archive_root.iterdir()):
+            if child.is_dir() and not child.is_symlink():
+                out.append(child)
+    out.extend(relocated_archive_children(root))
+    return out
+
+
+def scan_volume_archives() -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    live_targets = live_symlink_targets()
+    min_safe_age_seconds = VOLUME_RELOCATED_BACKUP_MIN_AGE_DAYS * 24 * 3600
+    seen: set[str] = set()
+
+    for volume_root in mounted_volume_roots():
+        for path in volume_archive_roots(volume_root):
+            path_key = str(path)
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            if overlaps_live_symlink_target(path, live_targets) or protected_volume_archive_path(path):
+                continue
+
+            bytes_value = path_disk_bytes(path)
+            if bytes_value < VOLUME_ARCHIVE_MIN_BYTES:
+                continue
+
+            if is_vpssentry_backup_copy(path) and age_seconds_for(path) > min_safe_age_seconds:
+                out.append(
+                    candidate(
+                        key="volume_relocated_backup",
+                        label="Relocated VPSSentry backup copies",
+                        path=path,
+                        bytes_value=bytes_value,
+                        action="remove_path",
+                        kind="directory",
+                        category="garbage",
+                        explanation=(
+                            "Old relocated VPSSentry backup copy on the mounted volume. The live backup base is "
+                            "the root-archive symlink target and retention keeps current snapshots there."
+                        ),
+                    )
+                )
+                continue
+
+            out.append(
+                candidate(
+                    key="volume_archive_review",
+                    label="Mounted-volume archive review",
+                    path=path,
+                    bytes_value=bytes_value,
+                    action="guided_review",
+                    kind="directory",
+                    category="guided",
+                    risk="guided",
+                    explanation=(
+                        "Archived or relocated mounted-volume payload. Review provenance and restore requirements "
+                        "before deleting; live app, chain, database, and symlinked dependency paths are excluded."
+                    ),
+                    requires_stop=False,
+                )
+            )
+
+    out.sort(key=lambda item: (-int(item.get("bytes") or 0), str(item.get("path") or "")))
+    return out
+
+
 def collect_candidates() -> list[dict[str, object]]:
     return dedupe_candidates(
         scan_tmp_candidates()
@@ -1076,6 +1271,7 @@ def collect_candidates() -> list[dict[str, object]]:
         + scan_apt_cache()
         + scan_journal_excess()
         + scan_backup_retention()
+        + scan_volume_archives()
         + scan_guided_node_modules()
     )
 

@@ -312,6 +312,7 @@ Current production storage notes:
 * `CreditChain` is tracked as the dormant protocol/chain surface for `chain.usetab.ca`; do not attach `chain.ascendai.one` to this project.
 * VPSSentry hourly app backups now preserve the cron-facing path `/home/tony/_backup/vps-sentry-web` as a symlink to `/mnt/HC_Volume_105319120/root-archive/vps-sentry-web-backups`.
 * Backup retention and safe reclaim must resolve that symlink target before pruning old snapshot directories, otherwise the mounted-volume backup sink silently grows.
+* Mounted-volume archive reclaim is intentionally split by posture: old relocated VPSSentry backup copies can be safe reclaim, old `_archive` / `_relocated` app bundles are guided review, and live symlinked dependency trees, databases, traces, downloads, WoloChain state, and settlement backups are protected.
 * The May 24, 2026 storage pass moved only that backup sink after verifying `1818` files / `1,282,162,535` bytes; it did not move or delete DBs, chain state, WoloChain settlement/operator state, live downloads, or production dependency trees.
 * After safe cache/log cleanup, backup relocation, rebuild, restart, and a fresh scan, root was about `64-65%` used with `13-14G` free and the mounted volume was about `77%` used with `12G` free.
 
