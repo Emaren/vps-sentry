@@ -120,12 +120,20 @@
       ]
     },
     {
+      "id": "ascendchain",
+      "label": "AscendChain",
+      "public_url": "https://chain.ascendai.one",
+      "domains": [
+        "chain.ascendai.one"
+      ],
+      "state": "dormant"
+    },
+    {
       "id": "creditchain",
       "label": "CreditChain",
       "public_url": "https://chain.usetab.ca",
       "domains": [
-        "chain.usetab.ca",
-        "chain.ascendai.one"
+        "chain.usetab.ca"
       ],
       "state": "dormant"
     },

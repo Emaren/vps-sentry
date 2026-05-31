@@ -35,6 +35,7 @@ JOURNAL_TARGET_BYTES = max(
     int(os.environ.get("VPS_SENTRY_GARBAGE_JOURNAL_TARGET_BYTES", str(200 * 1024 * 1024))),
 )
 BACKUP_KEEP = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP", "5")))
+BACKUP_KEEP_DAYS = max(1, int(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_KEEP_DAYS", "14")))
 TOP_PATHS_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_TOP_PATHS_LIMIT", "8")))
 PROGRESS_RECENT_LINES_LIMIT = max(3, int(os.environ.get("VPS_SENTRY_GARBAGE_PROGRESS_LINES", "6")))
 GUIDED_NODE_MODULES_MIN_BYTES = max(
@@ -180,10 +181,22 @@ def scan_roots() -> list[Path]:
 
 def backup_roots() -> list[Path]:
     configured = parse_csv_paths(os.environ.get("VPS_SENTRY_GARBAGE_BACKUP_DIRS"))
-    if configured:
-        return [root for root in configured if root.exists() and root.is_dir()]
-    defaults = [Path("/home/tony/_backup/vps-sentry-web")]
-    return [root for root in defaults if root.exists() and root.is_dir()]
+    roots = configured or [Path("/home/tony/_backup/vps-sentry-web")]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved = root
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
 
 
 def age_seconds_for(path: Path) -> float:
@@ -998,7 +1011,33 @@ def scan_journal_excess() -> list[dict[str, object]]:
 def scan_backup_retention() -> list[dict[str, object]]:
     out: list[dict[str, object]] = []
     suffixes = (".tgz", ".tar.gz", ".zip")
+    snapshot_dir_pattern = re.compile(r"^\d{8}T\d{6}Z(?:[-_][A-Za-z0-9._-]+)?$")
+    min_age_seconds = BACKUP_KEEP_DAYS * 24 * 3600
     for root in backup_roots():
+        snapshot_dirs = [
+            child
+            for child in root.iterdir()
+            if child.is_dir()
+            and snapshot_dir_pattern.match(child.name)
+            and age_seconds_for(child) > min_age_seconds
+        ]
+        for old_dir in sorted(snapshot_dirs, key=lambda item: item.stat(follow_symlinks=False).st_mtime):
+            bytes_value = path_disk_bytes(old_dir)
+            if bytes_value <= 0:
+                continue
+            out.append(
+                candidate(
+                    key="backup_dir_prune",
+                    label="Backup snapshot retention pruning",
+                    path=old_dir,
+                    bytes_value=bytes_value,
+                    action="remove_path",
+                    kind="path",
+                    category="garbage",
+                    explanation=f"Backup snapshot directory older than the retention window ({BACKUP_KEEP_DAYS} days).",
+                )
+            )
+
         archives = [
             child
             for child in root.iterdir()
