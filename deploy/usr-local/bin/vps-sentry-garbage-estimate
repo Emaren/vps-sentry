@@ -654,6 +654,9 @@ def candidate(
     explanation: str | None = None,
     regrows: bool = False,
     requires_stop: bool = False,
+    retention_class: str | None = None,
+    management_state: str | None = None,
+    operator_action: str | None = None,
 ) -> dict[str, object]:
     path_obj = Path(path) if not isinstance(path, Path) else path
     path_text = str(path_obj)
@@ -687,6 +690,12 @@ def candidate(
         "preview_command": preview_command_for(path_text),
         "execute_command": execute_command,
     }
+    if retention_class:
+        payload["retention_class"] = retention_class
+    if management_state:
+        payload["management_state"] = management_state
+    if operator_action:
+        payload["operator_action"] = operator_action
     if project_context:
         payload.update({key: value for key, value in project_context.items() if key != "service_refs"})
     if service_refs:
@@ -1178,6 +1187,82 @@ def is_vpssentry_backup_copy(path: Path) -> bool:
     return False
 
 
+def volume_archive_review_profile(path: Path) -> dict[str, str]:
+    lowered = str(path).lower()
+    child_names = set()
+    try:
+        child_names = {child.name.lower() for child in path.iterdir()}
+    except OSError:
+        child_names = set()
+
+    has_wolochain_restore_material = (
+        "space-hog-slaughter" in lowered
+        or "wolochain" in lowered
+        or "wolochain-settlement" in lowered
+        or (path / "root-moved" / "_snapshots" / "wolochain").exists()
+        or (path / "root-moved" / "ops-backups" / "wolochain-settlement").exists()
+    )
+    root_moved = path / "root-moved"
+    has_root_moved_incident_bundle = root_moved.is_dir() and any(root_moved.glob("incident-bundle-*"))
+    has_incident_bundle = (
+        "incident-bundle" in lowered
+        or any(name.startswith("incident-bundle") for name in child_names)
+        or has_root_moved_incident_bundle
+    )
+    has_signed_watcher = "signed-watcher" in lowered
+
+    if has_wolochain_restore_material:
+        return {
+            "key": "protected_restore_archive_review",
+            "label": "Protected chain restore archive",
+            "retention_class": "restore_backup",
+            "management_state": "policy_required",
+            "operator_action": "Keep guided until chain restore/export retention is explicit.",
+            "explanation": (
+                "Protected chain restore and incident evidence material. Compression of cold raw logs is allowed "
+                "with a manifest, but chain-home snapshots and settlement restore backups stay out of automatic cleanup."
+            ),
+        }
+
+    if has_signed_watcher:
+        return {
+            "key": "protected_signed_watcher_review",
+            "label": "Protected signed-watcher evidence",
+            "retention_class": "protected_evidence",
+            "management_state": "policy_required",
+            "operator_action": "Keep guided until signed evidence retention or off-box export is explicit.",
+            "explanation": (
+                "Signed watcher backup/evidence material. It is intentionally visible for management, but not safe "
+                "or rebuildable space."
+            ),
+        }
+
+    if has_incident_bundle:
+        return {
+            "key": "protected_incident_archive_review",
+            "label": "Protected incident archive review",
+            "retention_class": "protected_evidence",
+            "management_state": "policy_required",
+            "operator_action": "Keep guided until incident evidence retention or export is explicit.",
+            "explanation": (
+                "Incident evidence archive. Review provenance before removal; preserve hashes/manifests for any "
+                "compression or off-box migration."
+            ),
+        }
+
+    return {
+        "key": "volume_archive_review",
+        "label": "Mounted-volume archive review",
+        "retention_class": "unknown_archive",
+        "management_state": "inspect_first",
+        "operator_action": "Review provenance and restore requirements before deleting.",
+        "explanation": (
+            "Archived or relocated mounted-volume payload. Review provenance and restore requirements "
+            "before deleting; live app, chain, database, and symlinked dependency paths are excluded."
+        ),
+    }
+
+
 def relocated_archive_children(root: Path) -> list[Path]:
     relocated = root / "_relocated"
     if not relocated.is_dir():
@@ -1245,21 +1330,22 @@ def scan_volume_archives() -> list[dict[str, object]]:
                 )
                 continue
 
+            profile = volume_archive_review_profile(path)
             out.append(
                 candidate(
-                    key="volume_archive_review",
-                    label="Mounted-volume archive review",
+                    key=profile["key"],
+                    label=profile["label"],
                     path=path,
                     bytes_value=bytes_value,
                     action="guided_review",
                     kind="directory",
                     category="guided",
                     risk="guided",
-                    explanation=(
-                        "Archived or relocated mounted-volume payload. Review provenance and restore requirements "
-                        "before deleting; live app, chain, database, and symlinked dependency paths are excluded."
-                    ),
+                    explanation=profile["explanation"],
                     requires_stop=False,
+                    retention_class=profile["retention_class"],
+                    management_state=profile["management_state"],
+                    operator_action=profile["operator_action"],
                 )
             )
 

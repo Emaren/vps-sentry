@@ -1589,6 +1589,163 @@ def systemd_unit_text(unit: str) -> str | None:
     return value
 
 
+def systemd_show_props(unit: str, props: List[str]) -> Dict[str, str]:
+    unit_name = str(unit or "").strip()
+    if not unit_name or "/" in unit_name:
+        return {}
+    args = ["systemctl", "show", unit_name, "--no-pager"]
+    for prop in props:
+        args.extend(["-p", prop])
+    rc, out = run_cmd(args, timeout=10)
+    if rc != 0:
+        return {}
+    result: Dict[str, str] = {}
+    for raw_line in out.splitlines():
+        key, sep, value = raw_line.partition("=")
+        if sep:
+            result[key.strip()] = value.strip()
+    return result
+
+
+def systemd_bool(value: str) -> bool | None:
+    text = str(value or "").strip().lower()
+    if text in ("yes", "true", "1", "on"):
+        return True
+    if text in ("no", "false", "0", "off"):
+        return False
+    return None
+
+
+def load_project_service_entries() -> List[Dict[str, Any]]:
+    try:
+        payload = json.loads(PROJECTS_FILE.read_text())
+    except Exception:
+        return []
+
+    projects = payload.get("projects")
+    if not isinstance(projects, list):
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    for raw_project in projects:
+        if not isinstance(raw_project, dict):
+            continue
+        project_id = str(raw_project.get("id") or "").strip()
+        project_label = str(raw_project.get("label") or project_id or "unknown").strip()
+        services = raw_project.get("services")
+        if not isinstance(services, list):
+            continue
+        for raw_service in services:
+            if not isinstance(raw_service, dict):
+                continue
+            unit = str(raw_service.get("unit") or "").strip()
+            if not unit:
+                continue
+            domain = str(raw_service.get("domain") or "").strip()
+            health_urls = raw_service.get("health_urls")
+            publicish = bool(domain)
+            if isinstance(health_urls, list):
+                for url in health_urls:
+                    url_text = str(url or "")
+                    if url_text.startswith("https://"):
+                        publicish = True
+            entries.append({
+                "project_id": project_id,
+                "project_label": project_label,
+                "unit": unit,
+                "service_label": str(raw_service.get("label") or unit).strip(),
+                "domain": domain,
+                "public": publicish,
+                "severity": str(raw_service.get("severity") or "warn").strip(),
+            })
+    return entries
+
+
+def detect_service_hardening_gaps(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not bool(cfg.get("enable_service_hardening_checks", True)):
+        return []
+
+    max_findings = int(cfg.get("service_hardening_max_findings", 8))
+    findings: List[Dict[str, Any]] = []
+    props = [
+        "ActiveState",
+        "User",
+        "DynamicUser",
+        "NoNewPrivileges",
+        "PrivateTmp",
+        "ProtectSystem",
+        "ProtectHome",
+        "ReadWritePaths",
+        "WorkingDirectory",
+    ]
+
+    for entry in load_project_service_entries():
+        if not bool(entry.get("public")):
+            continue
+        unit = str(entry.get("unit") or "")
+        values = systemd_show_props(unit, props)
+        if not values:
+            continue
+        if values.get("ActiveState") not in ("active", "activating"):
+            continue
+
+        user = values.get("User", "")
+        dynamic_user = systemd_bool(values.get("DynamicUser", ""))
+        no_new_privileges = systemd_bool(values.get("NoNewPrivileges", ""))
+        private_tmp = systemd_bool(values.get("PrivateTmp", ""))
+        protect_system = values.get("ProtectSystem", "")
+        protect_home = values.get("ProtectHome", "")
+
+        gaps: List[str] = []
+        if (not user or user == "root" or user == "0") and dynamic_user is not True:
+            gaps.append("service runs as root")
+        if no_new_privileges is not True:
+            gaps.append("NoNewPrivileges is not enabled")
+        if protect_system not in ("full", "strict"):
+            gaps.append("ProtectSystem is not full/strict")
+        if private_tmp is not True:
+            gaps.append("PrivateTmp is not enabled")
+        if protect_home not in ("yes", "read-only", "tmpfs"):
+            gaps.append("ProtectHome is not enabled")
+
+        if not gaps:
+            continue
+
+        severity = "warn"
+        if "service runs as root" in gaps and "NoNewPrivileges is not enabled" in gaps:
+            severity = "critical"
+
+        findings.append({
+            "id": f"service-hardening:{unit}",
+            "unit": unit,
+            "project_id": entry.get("project_id") or "",
+            "project_label": entry.get("project_label") or "",
+            "service_label": entry.get("service_label") or unit,
+            "domain": entry.get("domain") or "",
+            "severity": severity,
+            "gaps": gaps,
+            "user": user or "root",
+            "dynamic_user": dynamic_user,
+            "no_new_privileges": no_new_privileges,
+            "private_tmp": private_tmp,
+            "protect_system": protect_system or "",
+            "protect_home": protect_home or "",
+            "read_write_paths": values.get("ReadWritePaths", ""),
+            "working_directory": values.get("WorkingDirectory", ""),
+        })
+
+    severity_weight = {"critical": 2, "warn": 1}
+    findings.sort(
+        key=lambda item: (
+            severity_weight.get(str(item.get("severity") or "warn"), 0),
+            len(item.get("gaps", []) if isinstance(item.get("gaps"), list) else []),
+            str(item.get("unit") or ""),
+        ),
+        reverse=True,
+    )
+    return findings[:max(1, max_findings)]
+
+
 def unit_temp_path_noexec(unit: str, runtime_path: str) -> bool | None:
     text = systemd_unit_text(unit)
     if text is None:
@@ -1755,6 +1912,32 @@ def _build_process_ioc_detail(hits: List[Dict[str, Any]]) -> str:
         cmd = str(h.get("cmdline", "") or "")
         if cmd:
             lines.append(f"  cmdline={cmd}")
+    return clamp("\n".join(lines), 1800)
+
+
+def _build_service_hardening_detail(hits: List[Dict[str, Any]]) -> str:
+    lines = ["Public service hardening gap(s) detected."]
+    for h in (hits or [])[:8]:
+        unit = str(h.get("unit") or "unknown")
+        project = str(h.get("project_label") or h.get("project_id") or "unknown")
+        domain = str(h.get("domain") or "")
+        domain_suffix = f" domain={domain}" if domain else ""
+        lines.append(f"- {unit} project={project}{domain_suffix}")
+        gaps = h.get("gaps", []) or []
+        if gaps:
+            lines.append("  gaps: " + "; ".join([str(x) for x in gaps[:6]]))
+        lines.append(
+            "  "
+            + " ".join(
+                [
+                    f"user={h.get('user', 'root')}",
+                    f"NoNewPrivileges={h.get('no_new_privileges')}",
+                    f"PrivateTmp={h.get('private_tmp')}",
+                    f"ProtectSystem={h.get('protect_system') or '-'}",
+                    f"ProtectHome={h.get('protect_home') or '-'}",
+                ]
+            )
+        )
     return clamp("\n".join(lines), 1800)
 
 
@@ -2323,10 +2506,29 @@ def main():
             "detail": f"{len(process_iocs)} suspicious runtime process(es) matched IOC heuristics.",
         })
 
+    service_hardening_gaps = detect_service_hardening_gaps(cfg)
+    if service_hardening_gaps:
+        top_gap = service_hardening_gaps[0]
+        worst_severity = str(top_gap.get("severity") or "warn")
+        if bool(cfg.get("alert_on_service_hardening_gap", True)):
+            ioc_alerts.append(make_alert(
+                title="Public service hardening gap detected",
+                detail=_build_service_hardening_detail(service_hardening_gaps),
+                severity="critical" if worst_severity == "critical" else "warn",
+                code="service_hardening_gap",
+            ))
+        threat_indicators.append({
+            "id": "service-hardening-gap",
+            "severity": "critical" if worst_severity == "critical" else "warn",
+            "title": "Public service hardening gap detected",
+            "detail": f"{len(service_hardening_gaps)} public service(s) need tighter systemd containment.",
+        })
+
     threat_payload = {
         "suspicious_processes": process_iocs,
         "outbound_suspicious": outbound_iocs,
         "persistence_hits": [],
+        "service_hardening_gaps": service_hardening_gaps,
         "indicators": threat_indicators,
     }
     vitals_payload = collect_resource_vitals(

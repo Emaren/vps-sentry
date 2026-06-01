@@ -27,7 +27,8 @@ Runs on a systemd timer (default: every 5 minutes):
    The process classifier resolves `/proc/<pid>/exe` before dropping low-CPU rows so relative commands launched from `/tmp`, `/var/tmp`, `/dev/shm`, or `/run` still surface as runtime IOCs.
    When the owning systemd unit is known, IOC details compare the unit's declared temp-path hardening with the live `/proc/<pid>/mountinfo` namespace, so config that says `noexec` but is not actually active is reported as ineffective instead of protected. Counterstrike also preserves `/proc/<pid>/exe` and `mountinfo` before killing a process, which keeps evidence available even when the executable was deleted or hidden behind a private temp namespace.
 2. **Threat telemetry for UI/API**  
-   Publishes structured `threat` data (`suspicious_processes`, `outbound_suspicious`, `persistence_hits`, `indicators`) into `status.json`.
+   Publishes structured `threat` data (`suspicious_processes`, `outbound_suspicious`, `persistence_hits`, `service_hardening_gaps`, `indicators`) into `status.json`.
+   Public services listed in `/etc/vps-sentry-projects.json` are inspected for root execution, `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem`, and `ProtectHome` gaps so containment drift becomes operator-visible instead of living only in notes.
 3. **Wide host drift coverage in one agent**  
    Correlates auth noise, public listeners, users, watched security paths, cron, firewall, self-integrity, and package drift.
 4. **Self-integrity + service integrity checks**  
@@ -316,6 +317,8 @@ Current production storage notes:
 * The June 1, 2026 guided archive audit reclaimed only obsolete AoE2DEWarWagers app/download copies after exact symlink, systemd, and nginx reference checks. Remaining guided archive targets are evidence/protected material until reviewed off-box or retained by policy.
 * Signed-watcher backup retention can hardlink byte-identical duplicate payloads inside the backup set to reclaim disk while preserving every evidence path; VPSSentry disk-byte estimates count shared inodes once inside a scanned tree.
 * The June 1, 2026 space-hog evidence pass gzip-compressed cold raw nginx logs inside the incident bundle with a manifest, while leaving WoloChain chain-home snapshots and settlement backups untouched.
+* Guided mounted-volume archive rows now carry retention posture (`protected_evidence`, `restore_backup`, or `unknown_archive`), management state, and the next operator action so protected incident/restore material is not confused with safe cleanup.
+* Public-facing service hardening gaps now publish into `threat.service_hardening_gaps` and can raise `service_hardening_gap` alerts; this is intended to catch root-run or weakly-contained services before they become an incursion path.
 * The May 24, 2026 storage pass moved only that backup sink after verifying `1818` files / `1,282,162,535` bytes; it did not move or delete DBs, chain state, WoloChain settlement/operator state, live downloads, or production dependency trees.
 * After safe cache/log cleanup, backup relocation, rebuild, restart, and a fresh scan, root was about `64-65%` used with `13-14G` free and the mounted volume was about `77%` used with `12G` free.
 
