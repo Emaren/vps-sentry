@@ -1666,6 +1666,11 @@ def detect_service_hardening_gaps(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
     max_findings = int(cfg.get("service_hardening_max_findings", 8))
+    skip_units = {
+        str(unit or "").strip()
+        for unit in cfg.get("service_hardening_skip_units", ["nginx.service", "ssh.service", "sshd.service"])
+        if str(unit or "").strip()
+    }
     findings: List[Dict[str, Any]] = []
     props = [
         "ActiveState",
@@ -1683,6 +1688,8 @@ def detect_service_hardening_gaps(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not bool(entry.get("public")):
             continue
         unit = str(entry.get("unit") or "")
+        if unit in skip_units:
+            continue
         values = systemd_show_props(unit, props)
         if not values:
             continue
