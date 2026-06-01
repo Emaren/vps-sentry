@@ -315,6 +315,7 @@ Current production storage notes:
 * Mounted-volume archive reclaim is intentionally split by posture: old relocated VPSSentry backup copies can be safe reclaim, old `_archive` / `_relocated` app bundles are guided review, and live symlinked dependency trees, databases, traces, downloads, WoloChain state, and settlement backups are protected.
 * The June 1, 2026 guided archive audit reclaimed only obsolete AoE2DEWarWagers app/download copies after exact symlink, systemd, and nginx reference checks. Remaining guided archive targets are evidence/protected material until reviewed off-box or retained by policy.
 * Signed-watcher backup retention can hardlink byte-identical duplicate payloads inside the backup set to reclaim disk while preserving every evidence path; VPSSentry disk-byte estimates count shared inodes once inside a scanned tree.
+* The June 1, 2026 space-hog evidence pass gzip-compressed cold raw nginx logs inside the incident bundle with a manifest, while leaving WoloChain chain-home snapshots and settlement backups untouched.
 * The May 24, 2026 storage pass moved only that backup sink after verifying `1818` files / `1,282,162,535` bytes; it did not move or delete DBs, chain state, WoloChain settlement/operator state, live downloads, or production dependency trees.
 * After safe cache/log cleanup, backup relocation, rebuild, restart, and a fresh scan, root was about `64-65%` used with `13-14G` free and the mounted volume was about `77%` used with `12G` free.
 
