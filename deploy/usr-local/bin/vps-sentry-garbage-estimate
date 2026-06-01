@@ -511,6 +511,7 @@ def walk_path_usage(path: Path) -> dict[str, int]:
     disk_bytes = getattr(root_stat, "st_blocks", 0) * 512 or root_stat.st_size
     apparent_bytes = root_stat.st_size
     file_count = 0
+    counted_disk_inodes: set[tuple[int, int]] = {(int(root_stat.st_dev), int(root_stat.st_ino))}
 
     if path.is_file() or path.is_symlink():
         return {
@@ -533,7 +534,10 @@ def walk_path_usage(path: Path) -> dict[str, int]:
                 continue
             if st.st_dev != root_dev:
                 continue
-            disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
+            inode_key = (int(st.st_dev), int(st.st_ino))
+            if inode_key not in counted_disk_inodes:
+                counted_disk_inodes.add(inode_key)
+                disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
             apparent_bytes += st.st_size
             kept_dirs.append(name)
         dirnames[:] = kept_dirs
@@ -546,7 +550,10 @@ def walk_path_usage(path: Path) -> dict[str, int]:
                 continue
             if st.st_dev != root_dev:
                 continue
-            disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
+            inode_key = (int(st.st_dev), int(st.st_ino))
+            if inode_key not in counted_disk_inodes:
+                counted_disk_inodes.add(inode_key)
+                disk_bytes += getattr(st, "st_blocks", 0) * 512 or st.st_size
             apparent_bytes += st.st_size
             file_count += 1
 
