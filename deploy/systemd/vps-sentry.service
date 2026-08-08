@@ -61,5 +61,6 @@ ReadWritePaths=/var/lib/vps-sentry
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=200
 
-# Guard rails
-TimeoutStartSec=45s
+# Guard rails. The hourly uncached project-footprint pass traverses protected
+# root/volume trees and currently needs roughly 45 seconds on production.
+TimeoutStartSec=2min

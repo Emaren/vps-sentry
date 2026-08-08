@@ -60,6 +60,9 @@ jobs:
           set -euo pipefail
           python3 -m py_compile runtime/vps_sentry/core_legacy.py
 
+      - name: Project storage continuity tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
       - name: Assert security invariants
         run: |
           set -euo pipefail

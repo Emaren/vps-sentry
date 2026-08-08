@@ -1431,6 +1431,39 @@ def merge_into_last(snapshot: dict[str, object], storage_alerts: list[dict[str, 
     write_json(LAST_JSON, payload, 0o644)
 
 
+def merge_previous_snapshot_for_continuity(
+    previous_snapshot: dict[str, object] | None,
+    config: dict[str, object],
+) -> bool:
+    """Keep verified storage telemetry visible while an expired snapshot refreshes.
+
+    load_previous_snapshot() already rejects schema and project-registry drift, so
+    only a snapshot produced from the current configuration reaches this helper.
+    Project totals retain their original measured_at value, while the inexpensive
+    root and mounted-filesystem capacity readings are refreshed for this patrol.
+    """
+    if not isinstance(previous_snapshot, dict):
+        return False
+    if int(previous_snapshot.get("schema_version", 0) or 0) != SCHEMA_VERSION:
+        return False
+    if str(previous_snapshot.get("config_fingerprint") or "") != config_fingerprint():
+        return False
+
+    try:
+        continuity_snapshot = {
+            **previous_snapshot,
+            "host_filesystem": measure_host_filesystem(),
+            "mounted_filesystems": measure_mounted_filesystems(config, previous_snapshot),
+        }
+        merge_into_last(continuity_snapshot, build_storage_alerts(continuity_snapshot))
+    except Exception as exc:
+        log(f"warn: failed to preserve previous project storage during refresh: {exc}")
+        return False
+
+    log("preserved previous project storage while refreshing expired snapshot")
+    return True
+
+
 def main() -> int:
     if not LAST_JSON.exists():
         log(f"warn: missing {LAST_JSON}; nothing to do")
@@ -1444,33 +1477,36 @@ def main() -> int:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
     except Exception as exc:
         log(f"warn: lock unavailable, continuing without it: {exc}")
-
-    config = load_config()
-    previous_snapshot = load_previous_snapshot()
-    snapshot = load_cached_snapshot()
-    if snapshot is None:
-        snapshot = build_snapshot(previous_snapshot)
-        try:
-            write_json(CACHE_JSON, snapshot, 0o600)
-        except Exception as exc:
-            log(f"warn: failed to write cache {CACHE_JSON}: {exc}")
-    else:
-        log("using cached project storage snapshot")
-        snapshot["host_filesystem"] = measure_host_filesystem()
-        snapshot["mounted_filesystems"] = measure_mounted_filesystems(config, previous_snapshot)
-
-    storage_alerts = build_storage_alerts(snapshot)
-
     try:
-        merge_into_last(snapshot, storage_alerts)
-    except Exception as exc:
-        log(f"warn: failed to merge project storage into {LAST_JSON}: {exc}")
-        return 0
+        config = load_config()
+        previous_snapshot = load_previous_snapshot()
+        snapshot = load_cached_snapshot()
+        if snapshot is None:
+            merge_previous_snapshot_for_continuity(previous_snapshot, config)
+            snapshot = build_snapshot(previous_snapshot)
+            try:
+                write_json(CACHE_JSON, snapshot, 0o600)
+            except Exception as exc:
+                log(f"warn: failed to write cache {CACHE_JSON}: {exc}")
+        else:
+            log("using cached project storage snapshot")
+            snapshot["host_filesystem"] = measure_host_filesystem()
+            snapshot["mounted_filesystems"] = measure_mounted_filesystems(config, previous_snapshot)
 
-    projects = snapshot.get("projects", {})
-    measured_count = len(projects) if isinstance(projects, dict) else 0
-    log(f"ok: merged project storage for {measured_count} project(s) alerts={len(storage_alerts)}")
-    return 0
+        storage_alerts = build_storage_alerts(snapshot)
+
+        try:
+            merge_into_last(snapshot, storage_alerts)
+        except Exception as exc:
+            log(f"warn: failed to merge project storage into {LAST_JSON}: {exc}")
+            return 0
+
+        projects = snapshot.get("projects", {})
+        measured_count = len(projects) if isinstance(projects, dict) else 0
+        log(f"ok: merged project storage for {measured_count} project(s) alerts={len(storage_alerts)}")
+        return 0
+    finally:
+        lock_handle.close()
 
 
 if __name__ == "__main__":

@@ -358,6 +358,46 @@ json_alerts_summary
 echo
 echo "== 5b) published dashboard status invariants =="
 [[ "$(stat -c '%a' "$STATE_DIR")" == "711" ]] || die "$STATE_DIR mode drifted (expected 711)"
+python3 - "$PUBLIC_STATUS_FILE" "$PROJECTS_FILE" <<'PY' || die "published project storage telemetry is incomplete"
+import json
+import sys
+from pathlib import Path
+
+status = json.loads(Path(sys.argv[1]).read_text())
+registry = json.loads(Path(sys.argv[2]).read_text())
+storage = status.get("project_storage")
+if not isinstance(storage, dict):
+    raise SystemExit("project_storage is missing")
+
+host = storage.get("host_filesystem")
+if not isinstance(host, dict) or int(host.get("total_bytes") or 0) <= 0:
+    raise SystemExit("root filesystem telemetry is missing")
+
+projects = storage.get("projects")
+if not isinstance(projects, dict) or not projects:
+    raise SystemExit("tracked project telemetry is missing")
+tracked_bytes = sum(
+    int(project.get("disk_bytes") or 0)
+    for project in projects.values()
+    if isinstance(project, dict)
+)
+if tracked_bytes <= 0:
+    raise SystemExit("tracked project footprints total zero bytes")
+
+mounted = storage.get("mounted_filesystems")
+mounted_by_path = {
+    str(row.get("path") or ""): row
+    for row in mounted
+    if isinstance(row, dict)
+} if isinstance(mounted, list) else {}
+for configured in registry.get("host_filesystems") or []:
+    path = configured if isinstance(configured, str) else configured.get("path") if isinstance(configured, dict) else None
+    if not isinstance(path, str) or not path:
+        continue
+    row = mounted_by_path.get(path)
+    if not isinstance(row, dict) or not row.get("exists") or int(row.get("total_bytes") or 0) <= 0:
+        raise SystemExit(f"configured mounted filesystem telemetry is missing: {path}")
+PY
 if systemctl is-active --quiet vps-sentry-web.service; then
   WEB_USER="$(service_user_for_unit vps-sentry-web.service)"
   assert_public_status_readable "$WEB_USER"

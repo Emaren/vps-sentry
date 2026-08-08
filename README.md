@@ -289,6 +289,7 @@ Mounted volume telemetry:
 
 * `/etc/vps-sentry-projects.json` can declare extra host filesystems under `host_filesystems`.
 * `/usr/local/bin/vps-sentry-project-storage` measures those mounts on every patrol merge, even when project-root totals are served from cache.
+* The hourly uncached footprint refresh is allowed up to two minutes by the patrol unit. Before that slower refresh starts, the scanner re-merges the last schema/config-verified project snapshot with fresh root and mounted-filesystem capacity readings. If the refresh is interrupted, the dashboard therefore keeps the prior project totals and their original `measured_at` timestamp instead of publishing an empty storage workbench.
 * `project_storage.mounted_filesystems[]` in published `status.json` carries:
   * live capacity and usage (`total_bytes`, `used_bytes`, `available_bytes`, `used_percent`)
   * backing block-device capacity when Linux exposes it (`device_source`, `device_size_bytes`)
