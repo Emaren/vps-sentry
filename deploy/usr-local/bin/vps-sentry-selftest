@@ -286,6 +286,8 @@ test -x "$COUNTERSTRIKE" || die "missing or not executable: $COUNTERSTRIKE"
 echo
 echo "== 2) systemd wiring =="
 systemctl is-enabled vps-sentry.timer >/dev/null || die "vps-sentry.timer is not enabled"
+systemctl is-active --quiet vps-sentry.timer || die "vps-sentry.timer is enabled but not active"
+[[ "$(systemctl show vps-sentry.timer -p NeedDaemonReload --value)" == "no" ]] || die "vps-sentry.timer has unapplied unit changes; run systemctl daemon-reload"
 systemctl cat vps-sentry.service --no-pager >/dev/null || die "cannot read vps-sentry.service"
 test -f "$DROPIN" || die "missing drop-in: $DROPIN"
 grep -Eq "ExecStartPost=.*vps-sentry-ship" "$DROPIN" || die "drop-in does not reference vps-sentry-ship: $DROPIN"

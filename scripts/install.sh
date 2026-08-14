@@ -217,6 +217,8 @@ fi
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now vps-sentry.timer
+sudo systemctl is-active --quiet vps-sentry.timer || { echo "FATAL: vps-sentry.timer is not active after install" >&2; exit 1; }
+[[ "$(sudo systemctl show vps-sentry.timer -p NeedDaemonReload --value)" == "no" ]] || { echo "FATAL: systemd still requires daemon-reload after install" >&2; exit 1; }
 
 echo "Installed. Next:"
 echo "  runtime: $RUNTIME_BIN"
