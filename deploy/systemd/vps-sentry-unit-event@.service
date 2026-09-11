@@ -43,7 +43,9 @@ RestrictRealtime=yes
 SystemCallArchitectures=native
 
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-ReadWritePaths=/var/lib/vps-sentry /run/vps-sentry
+# RuntimeDirectory is writable automatically. Listing /run/vps-sentry here
+# makes namespace setup depend on that ephemeral path already existing.
+ReadWritePaths=/var/lib/vps-sentry
 
 LogRateLimitIntervalSec=30s
 LogRateLimitBurst=200

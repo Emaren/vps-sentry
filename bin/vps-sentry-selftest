@@ -295,6 +295,7 @@ grep -Eq "ExecStartPost=.*vps-sentry-garbage-estimate" "$DROPIN" || die "drop-in
 test -f "$EVENT_UNIT" || die "missing unit template: $EVENT_UNIT"
 grep -Eq 'Description=.*%i' "$EVENT_UNIT" || die "unit template description must use %i: $EVENT_UNIT"
 grep -Eq 'ExecStart=.*--spec %i' "$EVENT_UNIT" || die "unit template ExecStart must use %i: $EVENT_UNIT"
+grep -Fqx 'ReadWritePaths=/var/lib/vps-sentry' "$EVENT_UNIT" || die "event unit must not depend on pre-existing /run/vps-sentry: $EVENT_UNIT"
 test -f "$WEB_EVENT_DROPIN" || die "missing web event drop-in: $WEB_EVENT_DROPIN"
 python3 - "$PROJECTS_FILE" <<'PY' || die "missing disk storage roots for vps-sentry in $PROJECTS_FILE"
 import json
