@@ -42,7 +42,9 @@ contain_cpu_logind() {
 
   run_sudo systemctl stop aoe2dewarwagers-web.service || true
   while read -r stale_pid; do
-    [[ -n "$stale_pid" ]] && run_sudo kill -9 "$stale_pid" || true
+    if [[ -n "$stale_pid" ]]; then
+      run_sudo kill -9 "$stale_pid" || true
+    fi
   done < <(pgrep -f '[.]\/cpu-logind -c config.json|/var/tmp/[c]pu-logind' || true)
   run_sudo rm -f /var/tmp/cpu-logind /var/tmp/config.json
   run_sudo install -d -m 0755 /etc/systemd/system/aoe2dewarwagers-web.service.d
