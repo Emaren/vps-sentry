@@ -7,8 +7,6 @@ NOTIFY="/usr/local/bin/vps-sentry-notify"
 SERVICE_EVENT="/usr/local/bin/vps-sentry-service-event"
 MAINTENANCE="/usr/local/bin/vps-sentry-maintenance"
 PROJECT_STORAGE="/usr/local/bin/vps-sentry-project-storage"
-GARBAGE_ESTIMATE="/usr/local/bin/vps-sentry-garbage-estimate"
-GARBAGE_RECLAIM="/usr/local/bin/vps-sentry-garbage-reclaim"
 COUNTERSTRIKE="/usr/local/bin/vps-sentry-counterstrike"
 
 STATE_DIR="/var/lib/vps-sentry"
