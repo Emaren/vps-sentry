@@ -1513,7 +1513,17 @@ def detect_suspicious_process_iocs(cfg: Dict[str, Any], outbound_by_pid: Dict[in
         cmdline = ex.get("cmdline", "") or args
         if exe and any(r.search(exe) for r in exe_re):
             reasons.append("executable path is in suspicious writable runtime path")
-        elif argv0 and not argv0.startswith("/") and cwd and any(r.search(f"{cwd.rstrip('/')}/") for r in exe_re):
+        elif (
+            not exe
+            and argv0
+            and not argv0.startswith("/")
+            and cwd
+            and any(r.search(f"{cwd.rstrip('/')}/") for r in exe_re)
+        ):
+            # /proc/<pid>/exe is stronger execution evidence than cwd. Only use
+            # the cwd fallback when the executable cannot be resolved at all;
+            # otherwise normal daemons such as `sshd: [net]` with cwd=/run/sshd
+            # can be misclassified despite actually executing /usr/sbin/sshd.
             reasons.append(f"relative executable launched from suspicious writable runtime cwd ({cwd})")
 
         if not reasons:
