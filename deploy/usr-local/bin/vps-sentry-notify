@@ -805,6 +805,135 @@ send_email() {
   esac
 }
 
+email_preflight_state() {
+  local provider="${VPS_SENTRY_NOTIFY_EMAIL_PROVIDER:-auto}"
+  local to="${VPS_SENTRY_NOTIFY_EMAIL_TO:-}"
+  local server="${VPS_SENTRY_NOTIFY_EMAIL_SERVER:-}"
+  local from="${VPS_SENTRY_NOTIFY_EMAIL_FROM:-}"
+  local sendmail_path=""
+
+  [[ -n "$(trim "$to")" ]] || { printf 'unavailable'; return 0; }
+
+  case "$provider" in
+    smtp)
+      if [[ -n "$(trim "$server")" && -n "$(trim "$from")" ]]; then
+        printf 'ready'
+      else
+        printf 'unavailable'
+      fi
+      ;;
+    sendmail)
+      sendmail_path="$(resolve_exec_path "$SENDMAIL_BIN" || true)"
+      if [[ -n "$sendmail_path" ]] || command -v "$MAIL_BIN" >/dev/null 2>&1; then
+        printf 'unverified-local'
+      else
+        printf 'unavailable'
+      fi
+      ;;
+    auto)
+      if [[ -n "$(trim "$server")" && -n "$(trim "$from")" ]]; then
+        printf 'ready'
+      else
+        sendmail_path="$(resolve_exec_path "$SENDMAIL_BIN" || true)"
+        if [[ -n "$sendmail_path" ]] || command -v "$MAIL_BIN" >/dev/null 2>&1; then
+          printf 'unverified-local'
+        else
+          printf 'unavailable'
+        fi
+      fi
+      ;;
+    *)
+      printf 'invalid-provider'
+      ;;
+  esac
+}
+
+webhook_preflight_counts() {
+  local total=0 ready=0 paused=0 url marker_path marker_ts cooldown now_epoch age
+  cooldown="$(invalid_webhook_cooldown_seconds)"
+  now_epoch="$(date +%s)"
+
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+    total=$(( total + 1 ))
+    marker_path="$(invalid_webhook_marker_path "$url")"
+    if [[ -f "$marker_path" ]]; then
+      marker_ts="$(tr -d '\n' < "$marker_path" 2>/dev/null || true)"
+      if [[ "$marker_ts" =~ ^[0-9]+$ ]]; then
+        age=$(( now_epoch - marker_ts ))
+        if (( age < cooldown )); then
+          paused=$(( paused + 1 ))
+          continue
+        fi
+      fi
+    fi
+    ready=$(( ready + 1 ))
+  done < <(split_targets "${VPS_SENTRY_NOTIFY_WEBHOOK_URLS:-}")
+
+  printf '%s\t%s\t%s\n' "$total" "$ready" "$paused"
+}
+
+preflight_command() {
+  ensure_dirs
+
+  local email_state provider webhook_total webhook_ready webhook_paused
+  local severity route state overall=0 email_ready=0
+  provider="${VPS_SENTRY_NOTIFY_EMAIL_PROVIDER:-auto}"
+  email_state="$(email_preflight_state)"
+  [[ "$email_state" == "ready" ]] && email_ready=1
+  IFS=$'\t' read -r webhook_total webhook_ready webhook_paused < <(webhook_preflight_counts)
+
+  printf 'email_provider=%s email_state=%s recipients_configured=%s\n' \
+    "$provider" "$email_state" "$([[ -n "$(trim "${VPS_SENTRY_NOTIFY_EMAIL_TO:-}")" ]] && printf yes || printf no)"
+  printf 'webhooks_total=%s webhooks_ready=%s webhooks_paused=%s\n' \
+    "$webhook_total" "$webhook_ready" "$webhook_paused"
+
+  for severity in info warn critical; do
+    route="$(notification_route_for_severity "$severity")"
+    state="FAIL"
+    case "$route" in
+      none)
+        state="PASS"
+        ;;
+      email)
+        if (( email_ready )); then
+          state="PASS"
+        elif [[ "$email_state" == "unverified-local" ]]; then
+          state="DEGRADED"
+        fi
+        ;;
+      webhook)
+        (( webhook_ready > 0 )) && state="PASS"
+        ;;
+      both)
+        if (( email_ready && webhook_ready > 0 )); then
+          state="PASS"
+        elif (( email_ready || webhook_ready > 0 )); then
+          state="DEGRADED"
+        elif [[ "$email_state" == "unverified-local" ]]; then
+          state="DEGRADED"
+        fi
+        ;;
+      *)
+        state="FAIL"
+        ;;
+    esac
+
+    printf '%s_route=%s %s_state=%s\n' "$severity" "$route" "$severity" "$state"
+    if [[ "$state" == "FAIL" ]]; then
+      overall=1
+    elif [[ "$state" == "DEGRADED" && "$overall" -eq 0 ]]; then
+      overall=2
+    fi
+  done
+
+  case "$overall" in
+    0) printf 'preflight=PASS\n'; return 0 ;;
+    2) printf 'preflight=DEGRADED\n'; return 2 ;;
+    *) printf 'preflight=FAIL\n'; return 1 ;;
+  esac
+}
+
 deliver_notification() {
   local kind="$1"
   local now_iso="$2"
@@ -1277,6 +1406,7 @@ Usage:
   vps-sentry-notify alert --fingerprint <fp> --severity <level> --title <title> --detail <detail> [--source <source>] [--host <host>] [--project <project>] [--service <unit>] [--ts <iso>] [--evidence <path>]
   vps-sentry-notify recover --fingerprint <fp> [--severity <level>] [--title <title>] [--detail <detail>] [--source <source>] [--host <host>] [--project <project>] [--service <unit>] [--ts <iso>] [--evidence <path>]
   vps-sentry-notify status
+  vps-sentry-notify preflight
 EOF
 }
 
@@ -1297,6 +1427,7 @@ case "$cmd" in
   alert) handle_alert "$@" ;;
   recover) handle_recover "$@" ;;
   status) status_command ;;
+  preflight) preflight_command ;;
   -h|--help|help) usage ;;
   *) usage >&2; die "unknown command: $cmd" ;;
 esac

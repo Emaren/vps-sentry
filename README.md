@@ -273,6 +273,14 @@ Host-side notify config:
 * `VPS_SENTRY_NOTIFY_REMINDER_SCHEDULE=300,900,3600`
 * `VPS_SENTRY_NOTIFY_COOLDOWN_SECONDS=300`
 
+Validate notification route readiness without sending a message:
+
+```bash
+sudo /usr/local/bin/vps-sentry-notify preflight
+```
+
+`preflight` returns `0` only when every configured INFO/WARN/CRITICAL route is fully usable, `2` when a `both` route has only one usable transport, and `1` when any route has no usable transport. Local `sendmail` fallback without explicit SMTP is treated as unverified so an installed but broken MTA cannot masquerade as healthy delivery.
+
 Planned restart suppression:
 
 * `sudo vps-sentry-maintenance start --scope vps-sentry-web.service --ttl 10m --reason deploy`

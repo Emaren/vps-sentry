@@ -35,7 +35,7 @@ usage() {
   cat <<'EOF'
 Usage: vps-sentry-selftest [--with-network]
 
-Default mode validates deterministic local behavior only.
+Default mode validates deterministic local behavior plus notification route readiness.
 Use --with-network to additionally require successful webhook shipping.
 EOF
 }
@@ -282,6 +282,10 @@ test -x "$MAINTENANCE" || die "missing or not executable: $MAINTENANCE"
 test -x "$PROJECT_STORAGE" || die "missing or not executable: $PROJECT_STORAGE"
 test -x "$COUNTERSTRIKE" || die "missing or not executable: $COUNTERSTRIKE"
 "$SENTRY" --version || true
+
+echo
+echo "== 1b) notification delivery preflight =="
+"$NOTIFY" preflight || die "notification delivery preflight is not fully healthy"
 
 echo
 echo "== 2) systemd wiring =="
