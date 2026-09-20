@@ -19,6 +19,7 @@ jobs:
           for f in bin/* scripts/*.sh; do
             bash -n "$f"
           done
+          bash -n deploy/usr-local/bin/vps-sentry-notify deploy/usr-local/bin/vps-sentry-selftest
 
       - name: Install shellcheck
         run: |
@@ -26,7 +27,7 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: Shellcheck
-        run: shellcheck -x bin/* scripts/*.sh
+        run: shellcheck -x bin/* scripts/*.sh deploy/usr-local/bin/vps-sentry-notify deploy/usr-local/bin/vps-sentry-selftest
 
       - name: Prepare systemd verify shims
         run: |
