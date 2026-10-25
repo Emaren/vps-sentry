@@ -35,6 +35,7 @@ jobs:
           sudo install -d /usr/local/bin
           sudo install -m 0755 bin/vps-sentry /usr/local/bin/vps-sentry
           sudo install -m 0755 bin/vps-sentry-ship /usr/local/bin/vps-sentry-ship
+          sudo install -m 0755 deploy/usr-local/bin/vps-sentry-service-event /usr/local/bin/vps-sentry-service-event
 
       - name: Verify systemd unit files
         run: |
@@ -42,6 +43,7 @@ jobs:
           systemd-analyze verify \
             deploy/systemd/vps-sentry.service \
             deploy/systemd/vps-sentry-ship.service \
+            deploy/systemd/vps-sentry-unit-event@.service \
             deploy/systemd/vps-sentry.timer
 
       - name: Assert single unit source directory
