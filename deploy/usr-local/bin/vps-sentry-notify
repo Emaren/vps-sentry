@@ -1051,6 +1051,55 @@ reminder_due() {
   return 0
 }
 
+# A bounded, read-only view of existing root-only incident records.
+# Source-side health never equals independently accepted alert delivery.
+delivery_health_command() {
+  local ttl="${VPS_SENTRY_NOTIFY_DELIVERY_TTL_SECONDS:-21600}"
+  local now_epoch age observed_epoch file kind health rc=2 rows=0
+  [[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl > 0 && ttl <= 604800 )) || {
+    printf 'delivery_state=UNKNOWN reason=invalid-ttl\n'
+    return 2
+  }
+  now_epoch="$(date +%s)"
+  [[ -d "$INCIDENT_DIR" ]] || {
+    printf 'delivery_state=UNKNOWN reason=no-incident-state\n'
+    return 2
+  }
+  shopt -s nullglob
+  for file in "$OPEN_DIR"/*.state "$RESOLVED_DIR"/*.state; do
+    if (( rows >= 100 )); then
+      printf 'delivery_state=UNKNOWN reason=inspection-limit-exceeded inspected=%s\n' "$rows"
+      shopt -u nullglob
+      return 2
+    fi
+    rows=$(( rows + 1 ))
+    load_incident_file "$file" || continue
+    kind="open"
+    [[ "$file" == "$RESOLVED_DIR"/* ]] && kind="resolved"
+    health="UNKNOWN"
+    age="unknown"
+    if [[ -n "$LAST_DELIVERY_TS" ]] && observed_epoch="$(to_epoch "$LAST_DELIVERY_TS" 2>/dev/null)"; then
+      age=$(( now_epoch - observed_epoch ))
+      if (( age >= 0 && age <= ttl )); then
+        case "$LAST_DELIVERY_STATUS" in
+          FAILED|DISABLED|DEGRADED_UNVERIFIED) health="FAIL" ;;
+          *) health="UNKNOWN" ;;
+        esac
+      elif (( age > ttl )); then
+        health="STALE"
+      fi
+    fi
+    printf 'incident=%s service=%s evidence_state=%s transport_state=%s route=%s age_seconds=%s producer=vps-sentry-notify original_sink_receipt=UNKNOWN\n' \
+      "$kind" "$SERVICE" "$health" "$LAST_DELIVERY_STATUS" "$LAST_DELIVERY_ROUTE" "$age"
+    if [[ "$health" == "FAIL" ]]; then rc=1; fi
+  done
+  shopt -u nullglob
+  (( rows > 0 )) || printf 'delivery_state=UNKNOWN reason=no-incidents-observed\n'
+  printf 'delivery_state=%s checked_at=%s inspected=%s limited_to=100\n' \
+    "$([[ "$rc" == 1 ]] && printf FAIL || printf UNKNOWN)" "$(iso_utc_now)" "$rows"
+  return "$rc"
+}
+
 status_command() {
   ensure_dirs
   local count=0 file
@@ -1434,6 +1483,7 @@ Usage:
   vps-sentry-notify alert --fingerprint <fp> --severity <level> --title <title> --detail <detail> [--source <source>] [--host <host>] [--project <project>] [--service <unit>] [--ts <iso>] [--evidence <path>]
   vps-sentry-notify recover --fingerprint <fp> [--severity <level>] [--title <title>] [--detail <detail>] [--source <source>] [--host <host>] [--project <project>] [--service <unit>] [--ts <iso>] [--evidence <path>]
   vps-sentry-notify status
+  vps-sentry-notify delivery-health  # read-only, no contact with sinks
   vps-sentry-notify preflight
 EOF
 }
@@ -1455,6 +1505,7 @@ case "$cmd" in
   alert) handle_alert "$@" ;;
   recover) handle_recover "$@" ;;
   status) status_command ;;
+  delivery-health) delivery_health_command ;;
   preflight) preflight_command ;;
   -h|--help|help) usage ;;
   *) usage >&2; die "unknown command: $cmd" ;;
