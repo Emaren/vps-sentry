@@ -301,6 +301,15 @@ reset_incident_fields() {
   LAST_NOTIFY_KIND=""
   REMINDERS_SENT="0"
   NOTIFIED_COUNT="0"
+  # This transport outcome is not independently acknowledged by an operator.
+  LAST_DELIVERY_TS=""
+  LAST_DELIVERY_STATUS="UNKNOWN"
+  LAST_DELIVERY_ROUTE=""
+  LAST_DELIVERY_WEBHOOK_SUBMITTED="0"
+  LAST_DELIVERY_WEBHOOK_FAILED="0"
+  LAST_DELIVERY_WEBHOOK_PAUSED="0"
+  LAST_DELIVERY_EMAIL_SUBMITTED="0"
+  LAST_DELIVERY_EMAIL_FAILED="0"
   EVIDENCE_PATHS=""
   RESOLVED_TS=""
   RESOLVED_EPOCH="0"
@@ -348,6 +357,14 @@ write_incident_file() {
     printf 'LAST_NOTIFY_KIND=%q\n' "$LAST_NOTIFY_KIND"
     printf 'REMINDERS_SENT=%q\n' "$REMINDERS_SENT"
     printf 'NOTIFIED_COUNT=%q\n' "$NOTIFIED_COUNT"
+    printf 'LAST_DELIVERY_TS=%q\n' "$LAST_DELIVERY_TS"
+    printf 'LAST_DELIVERY_STATUS=%q\n' "$LAST_DELIVERY_STATUS"
+    printf 'LAST_DELIVERY_ROUTE=%q\n' "$LAST_DELIVERY_ROUTE"
+    printf 'LAST_DELIVERY_WEBHOOK_SUBMITTED=%q\n' "$LAST_DELIVERY_WEBHOOK_SUBMITTED"
+    printf 'LAST_DELIVERY_WEBHOOK_FAILED=%q\n' "$LAST_DELIVERY_WEBHOOK_FAILED"
+    printf 'LAST_DELIVERY_WEBHOOK_PAUSED=%q\n' "$LAST_DELIVERY_WEBHOOK_PAUSED"
+    printf 'LAST_DELIVERY_EMAIL_SUBMITTED=%q\n' "$LAST_DELIVERY_EMAIL_SUBMITTED"
+    printf 'LAST_DELIVERY_EMAIL_FAILED=%q\n' "$LAST_DELIVERY_EMAIL_FAILED"
     printf 'EVIDENCE_PATHS=%q\n' "$EVIDENCE_PATHS"
     printf 'RESOLVED_TS=%q\n' "$RESOLVED_TS"
     printf 'RESOLVED_EPOCH=%q\n' "$RESOLVED_EPOCH"
@@ -941,8 +958,16 @@ deliver_notification() {
   local subject body payload webhook_url
 
   route="$(notification_route_for_severity "$SEVERITY")"
+  LAST_DELIVERY_TS="$now_iso"
+  LAST_DELIVERY_ROUTE="$route"
+  LAST_DELIVERY_STATUS="UNKNOWN"
+  LAST_DELIVERY_WEBHOOK_SUBMITTED="0"
+  LAST_DELIVERY_WEBHOOK_FAILED="0"
+  LAST_DELIVERY_WEBHOOK_PAUSED="0"
+  LAST_DELIVERY_EMAIL_SUBMITTED="0"
+  LAST_DELIVERY_EMAIL_FAILED="0"
   case "$route" in
-    none) log "skip delivery route=none fingerprint=$FINGERPRINT"; return 0 ;;
+    none) LAST_DELIVERY_STATUS="DISABLED"; log "skip delivery route=none fingerprint=$FINGERPRINT"; return 1 ;;
     webhook) want_webhook=1 ;;
     email) want_email=1 ;;
     both) want_webhook=1; want_email=1 ;;
@@ -984,24 +1009,27 @@ deliver_notification() {
     fi
   fi
 
-  local attempted success failed
-  attempted=$(( webhook_sent + webhook_failed + email_sent + email_failed ))
+  local success failed
   success=$(( webhook_sent + email_sent ))
   failed=$(( webhook_failed + email_failed ))
+  LAST_DELIVERY_WEBHOOK_SUBMITTED="$webhook_sent"
+  LAST_DELIVERY_WEBHOOK_FAILED="$webhook_failed"
+  LAST_DELIVERY_WEBHOOK_PAUSED="$webhook_skipped"
+  LAST_DELIVERY_EMAIL_SUBMITTED="$email_sent"
+  LAST_DELIVERY_EMAIL_FAILED="$email_failed"
 
-  if (( attempted == 0 )); then
-    if (( webhook_skipped > 0 && success > 0 )); then
-      return 0
-    fi
-    log "no delivery attempts were made for fingerprint=$FINGERPRINT"
+  # 2xx / SMTP submission / sendmail exit zero is not operator acknowledgement.
+  if (( success == 0 )); then
+    LAST_DELIVERY_STATUS="FAILED"
+    log "notification transport unaccepted fingerprint=$FINGERPRINT failed=$failed paused=$webhook_skipped"
     return 1
   fi
-  if (( success == 0 && failed > 0 )); then
-    return 1
+  if (( failed > 0 || webhook_skipped > 0 )); then
+    LAST_DELIVERY_STATUS="DEGRADED_UNVERIFIED"
+    log "partial notification transport fingerprint=$FINGERPRINT submitted=$success failed=$failed paused=$webhook_skipped"
+    return 0
   fi
-  if (( failed > 0 )); then
-    log "partial delivery fingerprint=$FINGERPRINT success=$success failed=$failed"
-  fi
+  LAST_DELIVERY_STATUS="SUBMITTED_UNVERIFIED"
   return 0
 }
 
