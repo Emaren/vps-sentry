@@ -1206,6 +1206,7 @@ handle_alert() {
     send_kind="reminder"
   fi
 
+  local delivery_failed=0
   if [[ -n "$send_kind" ]]; then
     if deliver_notification "$send_kind" "$now_iso"; then
       OPEN_NOTIFIED="1"
@@ -1216,10 +1217,17 @@ handle_alert() {
       if [[ "$send_kind" == "reminder" ]]; then
         REMINDERS_SENT="$(( REMINDERS_SENT + 1 ))"
       fi
+    else
+      delivery_failed=1
     fi
   fi
 
+  # Persist the failure receipt BEFORE surfacing a nonzero exit to systemd.
   write_incident_file "$incident_file"
+  if (( delivery_failed )); then
+    log "notification delivery failed after durable incident capture fingerprint=$FINGERPRINT"
+    return 1
+  fi
 }
 
 handle_recover() {
@@ -1282,13 +1290,20 @@ handle_recover() {
     DURATION_SECONDS="0"
   fi
 
+  local delivery_failed=0
   if [[ "$OPEN_NOTIFIED" == "1" ]]; then
-    deliver_notification "recovery" "$now_iso" || true
+    if ! deliver_notification "recovery" "$now_iso"; then
+      delivery_failed=1
+    fi
   fi
 
   resolved_file="$(resolved_file_for_fingerprint "$fingerprint")"
   write_incident_file "$resolved_file"
   rm -f "$incident_file"
+  if (( delivery_failed )); then
+    log "recovery notification failed after durable state capture fingerprint=$FINGERPRINT"
+    return 1
+  fi
 }
 
 handle_ship_last() {
