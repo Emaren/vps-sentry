@@ -49,7 +49,7 @@ class UnitEventLifecycleTests(unittest.TestCase):
             state = tmp / "state"
             log = tmp / "notifications.txt"
             notify = tmp / "notify"
-            notify.write_text('#!/bin/sh\nprintf "%s\\n" "$1" >> "$VPS_SENTRY_TEST_LOG"\n')
+            notify.write_text('#!/bin/sh\nprintf "%s\n" "$1" >> "$VPS_SENTRY_TEST_LOG"\n')
             notify.chmod(0o755)
 
             def fake_systemctl(event: str, active: bool) -> Path:
@@ -58,7 +58,7 @@ class UnitEventLifecycleTests(unittest.TestCase):
                 stub.write_text(
                     "#!/bin/sh\n"
                     f'if [ "$1" = "is-active" ]; then exit {status}; fi\n'
-                    'printf "%s\\n" "$1"\n'
+                    'printf "%s\n" "$1"\n'
                 )
                 stub.chmod(0o755)
                 return stub
@@ -92,13 +92,13 @@ class UnitEventLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             notifier = root / "notifier"
-            notifier.write_text("#!/bin/sh\\nexit 75\\n")
+            notifier.write_text("#!/bin/sh\nexit 75\n")
             notifier.chmod(0o755)
             systemctl = root / "systemctl"
             systemctl.write_text(
-                '#!/bin/sh\\n'
-                'if [ "$1" = "is-active" ]; then exit 0; fi\\n'
-                'printf "%s\\n" "$1"\\n'
+                '#!/bin/sh\n'
+                'if [ "$1" = "is-active" ]; then exit 0; fi\n'
+                'printf "%s\n" "$1"\n'
             )
             systemctl.chmod(0o755)
             env = dict(
