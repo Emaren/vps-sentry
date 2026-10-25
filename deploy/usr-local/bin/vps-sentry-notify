@@ -1056,10 +1056,14 @@ reminder_due() {
 delivery_health_command() {
   local ttl="${VPS_SENTRY_NOTIFY_DELIVERY_TTL_SECONDS:-21600}"
   local now_epoch age observed_epoch file kind health rc=2 rows=0
-  [[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl > 0 && ttl <= 604800 )) || {
+  if ! [[ "$ttl" =~ ^[0-9]{1,6}$ ]]; then
     printf 'delivery_state=UNKNOWN reason=invalid-ttl\n'
     return 2
-  }
+  fi
+  if (( ttl < 1 || ttl > 604800 )); then
+    printf 'delivery_state=UNKNOWN reason=invalid-ttl\n'
+    return 2
+  fi
   now_epoch="$(date +%s)"
   [[ -d "$INCIDENT_DIR" ]] || {
     printf 'delivery_state=UNKNOWN reason=no-incident-state\n'
