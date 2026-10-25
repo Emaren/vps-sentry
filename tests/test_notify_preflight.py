@@ -83,6 +83,23 @@ class NotifyPreflightTests(unittest.TestCase):
         self.assertIn("webhooks_total=1 webhooks_ready=0 webhooks_paused=1", proc.stdout)
         self.assertIn("preflight=FAIL", proc.stdout)
 
+    def test_disabled_critical_route_cannot_pass_readiness(self) -> None:
+        proc = self.run_preflight(
+            {
+                "VPS_SENTRY_NOTIFY_EMAIL_PROVIDER": "smtp",
+                "VPS_SENTRY_NOTIFY_EMAIL_SERVER": "smtp://user:pass@example.com:587",
+                "VPS_SENTRY_NOTIFY_EMAIL_FROM": "sentinel@example.com",
+                "VPS_SENTRY_NOTIFY_EMAIL_TO": "ops@example.com",
+                "VPS_SENTRY_NOTIFY_ROUTE_INFO": "none",
+                "VPS_SENTRY_NOTIFY_ROUTE_WARN": "email",
+                "VPS_SENTRY_NOTIFY_ROUTE_CRITICAL": "none",
+            }
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("info_route=none info_state=DISABLED", proc.stdout)
+        self.assertIn("critical_route=none critical_state=FAIL", proc.stdout)
+        self.assertIn("preflight=FAIL", proc.stdout)
+
     def test_both_route_with_only_smtp_is_degraded(self) -> None:
         proc = self.run_preflight(
             {
