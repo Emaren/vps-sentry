@@ -203,7 +203,9 @@ if [[ "$event" == "started" ]]; then
     for path in "${evidence_paths[@]}"; do
       cmd+=( --evidence "$path" )
     done
-    "${cmd[@]}" || true
+    # Propagate notifier failure after it has persisted the incident record.
+    # Otherwise systemd reports a healthy event hook despite no delivered alert.
+    "${cmd[@]}"
   else
     log "skip started event for $unit because unit is not active"
   fi
@@ -231,4 +233,5 @@ cmd=( "$NOTIFY_BIN" alert --fingerprint "$fingerprint" --severity critical --sou
 for path in "${evidence_paths[@]}"; do
   cmd+=( --evidence "$path" )
 done
-"${cmd[@]}" || true
+# Incident capture persists before a notification error is reported to systemd.
+"${cmd[@]}"
