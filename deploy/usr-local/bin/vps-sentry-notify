@@ -910,7 +910,10 @@ preflight_command() {
     state="FAIL"
     case "$route" in
       none)
-        state="PASS"
+        # A muted info route is intentional; a muted critical route is a
+        # genuine security-notification readiness failure, not a green PASS.
+        state="DISABLED"
+        [[ "$severity" != "critical" ]] || state="FAIL"
         ;;
       email)
         if (( email_ready )); then
