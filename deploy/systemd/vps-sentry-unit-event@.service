@@ -10,10 +10,12 @@ Group=root
 Nice=10
 UMask=0077
 
+# All event evidence, incident and notification state lives under the
+# persistent StateDirectory, not /run/vps-sentry. A shared RuntimeDirectory
+# causes overlapping started/stopped template instances to race its cleanup,
+# potentially failing namespace setup with 226/NAMESPACE.
 StateDirectory=vps-sentry
 StateDirectoryMode=0711
-RuntimeDirectory=vps-sentry
-RuntimeDirectoryMode=0755
 
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
@@ -43,8 +45,8 @@ RestrictRealtime=yes
 SystemCallArchitectures=native
 
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# RuntimeDirectory is writable automatically. Listing /run/vps-sentry here
-# makes namespace setup depend on that ephemeral path already existing.
+# Writable persistent event evidence only; no shared ephemeral /run mount
+# dependency. Preserve ProtectSystem=strict and other sandbox controls.
 ReadWritePaths=/var/lib/vps-sentry
 
 LogRateLimitIntervalSec=30s
