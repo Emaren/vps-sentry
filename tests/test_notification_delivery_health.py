@@ -73,7 +73,7 @@ class DeliveryHealthTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             env, state = self.fixture(temp, VPS_SENTRY_NOTIFY_ROUTE_CRITICAL="none")
             sent = self.alert(env)
-            self.assertEqual(sent.returncode, 0, sent.stderr)
+            self.assertEqual(sent.returncode, 1, sent.stderr)
             incident = self.incident(state)
             self.assertIn("OPEN_NOTIFIED=0", incident)
             self.assertIn("LAST_DELIVERY_STATUS=DISABLED", incident)
@@ -81,6 +81,21 @@ class DeliveryHealthTests(unittest.TestCase):
             self.assertEqual(health.returncode, 1, health.stdout)
             self.assertIn("evidence_state=FAIL", health.stdout)
             self.assertIn("transport_state=DISABLED", health.stdout)
+
+    def test_failed_configured_transport_returns_nonzero_with_durable_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env, state = self.fixture(
+                temp, VPS_SENTRY_NOTIFY_ROUTE_CRITICAL="email",
+            )
+            sent = self.alert(env)
+            self.assertEqual(sent.returncode, 1, sent.stderr)
+            incident = self.incident(state)
+            self.assertIn("OPEN_NOTIFIED=0", incident)
+            self.assertIn("LAST_DELIVERY_STATUS=FAILED", incident)
+            self.assertIn("LAST_DELIVERY_EMAIL_FAILED=1", incident)
+            health = self.invoke(env, "delivery-health")
+            self.assertEqual(health.returncode, 1, health.stdout)
+            self.assertIn("evidence_state=FAIL", health.stdout)
 
     def test_partial_webhook_submission_and_failed_email_remains_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
