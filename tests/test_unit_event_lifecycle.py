@@ -86,5 +86,36 @@ class UnitEventLifecycleTests(unittest.TestCase):
             self.assertTrue((state / "incidents" / "evidence").is_dir())
 
 
+    def test_failed_notification_propagates_to_systemd_hook_result(self) -> None:
+        # Existing source used `|| true` after notify, which made the hook
+        # report success even when all delivery routes failed.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            notifier = root / "notifier"
+            notifier.write_text("#!/bin/sh\\nexit 75\\n")
+            notifier.chmod(0o755)
+            systemctl = root / "systemctl"
+            systemctl.write_text(
+                '#!/bin/sh\\n'
+                'if [ "$1" = "is-active" ]; then exit 0; fi\\n'
+                'printf "%s\\n" "$1"\\n'
+            )
+            systemctl.chmod(0o755)
+            env = dict(
+                os.environ,
+                VPS_SENTRY_STATE_DIR=str(root / "state"),
+                VPS_SENTRY_NOTIFY_BIN=str(notifier),
+                VPS_SENTRY_SYSTEMCTL_BIN=str(systemctl),
+                VPS_SENTRY_JOURNALCTL_BIN="/bin/true",
+                VPS_SENTRY_PROJECT_META_BIN=str(root / "missing-meta"),
+            )
+            proc = subprocess.run(
+                ["bash", str(HOOK), "--spec", "started__ssh.service"],
+                env=env, capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertEqual(proc.returncode, 75, proc.stderr)
+            self.assertTrue((root / "state" / "incidents" / "evidence").is_dir())
+
+
 if __name__ == "__main__":
     unittest.main()
