@@ -35,6 +35,8 @@ jobs:
           sudo install -d /usr/local/bin
           sudo install -m 0755 bin/vps-sentry /usr/local/bin/vps-sentry
           sudo install -m 0755 bin/vps-sentry-ship /usr/local/bin/vps-sentry-ship
+          sudo install -m 0755 bin/vps-sentry-publish /usr/local/bin/vps-sentry-publish
+          sudo install -m 0755 bin/vps-sentry-ports-normalize /usr/local/bin/vps-sentry-ports-normalize
 
       - name: Verify systemd unit files
         run: |
