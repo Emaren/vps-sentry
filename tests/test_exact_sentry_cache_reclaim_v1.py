@@ -27,17 +27,24 @@ class ExactSingleCache(unittest.TestCase):
         (self.path / "generated.json").write_text('{"generated":true}')
         self.assertEqual(self.path.stat().st_dev, os.stat("/").st_dev)
         self.uuid = "test-root-uuid"
+        self.quarantine = self.path.parent / "protected-quarantine"
         self.bytes = 65536
         self.pinner = mock.patch.object(MODULE, "EXACT_SENTRY_NEXT_CACHE", self.path)
         self.uinner = mock.patch.object(MODULE, "EXACT_SENTRY_ROOT_UUID", self.uuid)
+        self.qpinner = mock.patch.object(MODULE, "EXACT_SENTRY_QUARANTINE", self.quarantine)
+        self.qowner = mock.patch.object(MODULE, "EXACT_QUARANTINE_OWNER_UID", os.geteuid())
         self.sizer = mock.patch.object(MODULE, "path_disk_bytes", return_value=self.bytes)
         self.mountinfo = mock.patch.object(MODULE.Path, "read_text", autospec=True, side_effect=self._read_text)
         self.pinner.start()
         self.uinner.start()
+        self.qpinner.start()
+        self.qowner.start()
         self.sizer.start()
         self.mountinfo.start()
         self.addCleanup(self.pinner.stop)
         self.addCleanup(self.uinner.stop)
+        self.addCleanup(self.qpinner.stop)
+        self.addCleanup(self.qowner.stop)
         self.addCleanup(self.sizer.stop)
         self.addCleanup(self.mountinfo.stop)
         self.calls = []
@@ -80,7 +87,7 @@ class ExactSingleCache(unittest.TestCase):
         self.assertTrue(good, detail)
         self.assertFalse(self.path.exists())
         self.assertTrue(self.path.parent.exists())
-        self.assertFalse(list(self.path.parent.glob(".sentry-one-cache-reclaim-*")))
+        self.assertFalse(list(self.quarantine.glob("one-sentry-cache-*")))
 
     def test_wrong_candidate_class_never_deletes(self):
         for key, value in (
